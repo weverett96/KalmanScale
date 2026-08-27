@@ -1,0 +1,13 @@
+[project]
+name = "kalmanscale"
+version = "0.1.0"
+description = "Kalman-filtered weight trend estimation from Whoop energy expenditure, calorie intake, and scale weight"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
