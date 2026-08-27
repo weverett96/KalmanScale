@@ -40,13 +40,16 @@ where $\xi_t \sim N(0, q_e)$ and $\phi \in (0,1)$ is the day-to-day persistence 
 
 Measurement: $z_t = x_t + e_t + \eta_t$, with $\eta_t \sim N(0, r)$ now the *genuinely* white residual (scale precision, timing jitter) — smaller than the old single-noise $r$, since the autocorrelated part has been pulled out into $e_t$.
 
-Still linear in the state (4x4 $F$ now, with $\phi$ in the $(4,4)$ entry), so a standard KF still applies — no EKF needed. $Q = \text{diag}(q_x, q_\beta, q_b, q_e)$, $r$, and $\phi$ are configuration, not hardcoded.
+Still linear in the state (4x4 $F$ now, with $\phi$ in the $(4,4)$ entry), so a standard KF still applies — no EKF needed. $Q = \text{diag}(q_x, q_\beta, q_b, q_e)$, $r$, and $\phi$ are configuration, not hardcoded. Consider using a tested library (e.g. `filterpy`) for the predict/update linear algebra rather than hand-rolling the covariance update — that's the highest-risk place for a subtle bug (asymmetric or non-PSD $P$) to hide; per-day $F$/$Q$ construction for gaps and missing calorie data still has to be bespoke either way.
+
+**Identifiability risk — $\beta$ vs. $b$:** both states add a constant per-day offset to $x_t$ ($\beta_{t-1}$ directly, $b_{t-1}$ scaled by $\div 3500$), and are structurally interchangeable from the measurement's point of view — an increase in $\beta$ and a decrease in $b$ predict the same $x_t$. They're only separable if $I_t - E_t$ varies enough over time to excite the difference; if intake/expenditure tracking is roughly steady day to day, $\hat\beta$ and $\hat b$ can trade off against each other even though $\hat x$ stays fine. Worth resolving with a synthetic test (see below) before trusting the individual values, and worth being clear that $\beta$ may end up representing residual/unexplained drift rather than "the trend" once $u_t$ already accounts for most calorie-driven change — see the caveat on the stat panel in Section 6.
 
 **Why this matters:** with only white $\eta_t$, the filter's posterior SE on $\beta$ reads more confident than it should, because it can't distinguish "true trend" from "still riding out Tuesday's high-sodium dinner." Separating $e_t$ out lets the filter correctly attribute a multi-day run of readings in one direction to a decaying transient rather than folding it into $\beta$ or $b$.
 
 **Testing approach for this module specifically:**
 - Generate synthetic data with known $\beta^*$, $b^*$, $\phi^*$, and injected AR(1) + white noise; assert the filter recovers $\beta^*$ and $b^*$ within a few SEs, and recovers something close to $\phi^*$/$q_e$ if you're estimating them rather than fixing them.
 - Specifically test that a simulated 3-day sodium spike (large $\xi_t$ then decay) does *not* get absorbed into $\hat\beta$ — this is the whole point of the extra state.
+- Identifiability check: run a synthetic series with $I_t - E_t$ held nearly constant and confirm whether $\hat\beta$ and $\hat b$ converge to their individual true values, or only their sum does. If they don't separate cleanly, revisit whether both need to be free states, or whether a tighter $q_b$ (bias changes slowly) relative to $q_\beta$ resolves it.
 - Edge cases: missing `cal_in`/`cal_out` on some days (net should fall back to 0 control input, not crash), gaps of >1 day between entries (multi-step predict, remembering $e_t$ decays each skipped day too), a single data point (should not update, just initialize).
 
 ## 4. Data ingestion
@@ -61,6 +64,8 @@ Still linear in the state (4x4 $F$ now, with $\phi$ in the $(4,4)$ entry), so a 
 - Periodically export weight history as CSV from Garmin Connect and bulk-import.
 - Revisit only if the manual entry actually becomes a compliance problem in practice.
 
+**Intake (`cal_in`) — manual, by design.** No app integration (e.g. MyFitnessPal, Cronometer) for v1 — enter an estimate manually through the same form each day. This is a deliberate scope decision, not a gap; see Section 8.
+
 ## 5. API
 
 - `POST /entries` — upsert one day (date, weight, cal_in?, cal_out?)
@@ -73,7 +78,7 @@ Still linear in the state (4x4 $F$ now, with $\phi$ in the $(4,4)$ entry), so a 
 
 - Entry form (date, weight, cal in, cal out)
 - Chart: raw scatter + filtered trend line (Chart.js)
-- Stat panel: filtered weight, $\beta$ (lb/wk) ± SE, implied kcal/day balance, estimated bias $b$ ± SE, current water-weight transient $e_t$, and a plain z-score readout of whether $\beta$ is distinguishable from zero
+- Stat panel: filtered weight, $\beta$ (lb/wk) ± SE, implied kcal/day balance, estimated bias $b$ ± SE, current water-weight transient $e_t$, and a plain z-score readout of whether $\beta$ is distinguishable from zero. Caveat: since $u_t$ already accounts for most calorie-driven weight change, $\beta$ may read more as "residual/unexplained trend" than "the trend" — worth labeling accordingly rather than as a plain rate (see the identifiability note in Section 3).
 - Advanced/collapsed panel: $Q$ (including $q_e$), $\phi$, $r$ inputs
 - Log table with delete
 
@@ -81,16 +86,18 @@ This is close to a working reference implementation of the above already sitting
 
 ## 7. Milestones
 
-1. **Filter core + tests** — 4-state model including the AR(1) term from the start; get this right in isolation before anything touches a UI.
+1. **Filter core + tests** — 4-state model including the AR(1) term from the start; get this right in isolation before anything touches a UI. No historical backfill for v1 (see Section 8), so synthetic tests are the *sole* pre-launch correctness check — there's no real dataset to sanity-check against before go-live, so synthetic coverage needs to stand on its own. Also expect $\hat\beta$'s posterior SE to be wide for the first 1–2 weeks of real use (little data yet) — that's correct filter behavior, not a bug, worth remembering when the app first goes live.
 2. **API + SQLite** — CRUD on entries, wire the filter endpoint.
 3. **Frontend** — form, chart, stats, talking to the API.
 4. **Deploy to Pi** — get the app running persistently on the Pi before adding automation on top of it, so you can tell ingestion bugs apart from deployment bugs.
 5. **Whoop cron job** — OAuth setup, token refresh, daily pull into `entries`, failure logging.
 6. **Param tuning pass** — sanity-check default $Q$, $\phi$, and $r$ against a few weeks of your actual data; adjust rather than trust the values used in the earlier prototype.
-7. **v2 (optional):** units toggle (kg/lb); Garmin CSV bulk-import helper.
+7. **v2 (optional):** units toggle (kg/lb); Garmin CSV bulk-import helper; historical backfill of past Whoop/weight data to seed the filter on setup.
 
 ## 8. Open decisions to make while building
 
+- ~~MyFitnessPal/Cronometer integration for `cal_in`~~ — resolved: manual entry only, explicit non-goal for v1 (Section 4).
+- ~~Historical backfill on first launch~~ — resolved: start fresh, no backfill for v1; deferred to v2 (Section 7).
 - Units: lb-only vs. toggle. Simplify to one unit for v1.
 - What happens on a day with a weight entry but no calorie data — treat as a pure random-walk step on $x,\beta$ with $b$ carried forward? (Recommended: yes, exactly that — control input just drops to 0.)
 - Whether `GET /filter` returns the full trajectory (needed for the chart) or just the latest state (needed for the stat panel) — probably both, single response.
