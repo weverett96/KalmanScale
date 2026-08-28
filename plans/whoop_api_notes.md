@@ -28,6 +28,17 @@ Standard authorization-code flow:
   refresh speculatively/concurrently).
 - Access tokens are short-lived (`expires_in` seconds in the token response);
   an expired token returns `401`.
+- **Refresh tokens rotate and are single-use**: every refresh call returns a
+  *new* refresh token alongside the new access token, and immediately
+  invalidates the one that was just used. There's no fixed expiry on a
+  refresh token by itself, but using it burns it. Confirmed working
+  end-to-end via `scripts/whoop_auth.py` on 2026-08-27 (successful
+  `GET /v2/cycle` call with the resulting access token).
+  **Design implication for Milestone 5**: the cron job must persist the new
+  `refresh_token` from every refresh response back to storage, not just
+  reuse the original — and must never run concurrent refresh calls against
+  the same token (the second of two racing requests fails, since the first
+  invalidates it).
 
 ## 3. Scopes
 
