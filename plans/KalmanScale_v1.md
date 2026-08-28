@@ -66,6 +66,8 @@ Still linear in the state (4x4 $F$ now, with $\phi$ in the $(4,4)$ entry), so a 
 
 **Intake (`cal_in`) — manual, by design.** No app integration (e.g. MyFitnessPal, Cronometer) for v1 — enter an estimate manually through the same form each day. This is a deliberate scope decision, not a gap; see Section 8.
 
+Cronometer specifically was investigated (2026-08-28) and rejected on the same grounds as Garmin: no official self-serve API (enterprise-partner access only); the only integration path is an unofficial, reverse-engineered client hitting Cronometer's mobile app backend, authenticating with your actual account **username/password** (not a revocable OAuth token) — worse exposure than the Garmin case, for the same "one number a day" payoff. Revisit only if manual entry becomes a real compliance problem, same as Garmin.
+
 ## 5. API
 
 - `POST /entries` — upsert one day (date, weight, cal_in?, cal_out?)
