@@ -3,6 +3,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import db, whoop
@@ -11,6 +12,7 @@ from .filter import FilterParams, run_filter
 app = FastAPI(title="KalmanScale")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 class EntryIn(BaseModel):
@@ -23,6 +25,11 @@ class EntryIn(BaseModel):
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return FileResponse(STATIC_DIR / "logo.png")
 
 
 @app.get("/api/entries")
