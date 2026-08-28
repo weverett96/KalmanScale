@@ -52,7 +52,20 @@ async function api(path, opts) {
   return res.json();
 }
 
+let entriesByDate = {};
+
+function loadFormForDate(dateStr) {
+  const entry = entriesByDate[dateStr];
+  document.getElementById("weight").value = entry ? entry.weight : "";
+  document.getElementById("cal_in").value = entry && entry.cal_in !== null ? entry.cal_in : "";
+  document.getElementById("cal_out").value = entry && entry.cal_out !== null ? entry.cal_out : "";
+}
+
 document.getElementById("date").valueAsDate = new Date();
+
+document.getElementById("date").addEventListener("change", (ev) => {
+  loadFormForDate(ev.target.value);
+});
 
 document.getElementById("sync-btn").addEventListener("click", async () => {
   const status = document.getElementById("sync-status");
@@ -145,6 +158,9 @@ function renderTable(entries) {
 
 async function refresh() {
   const entries = await api("/api/entries");
+  entriesByDate = Object.fromEntries(entries.map(e => [e.date, e]));
+  loadFormForDate(document.getElementById("date").value);
+
   const filterResult = await api("/api/filter");
   renderStats(filterResult.latest);
   renderChart(entries, filterResult.trajectory);
