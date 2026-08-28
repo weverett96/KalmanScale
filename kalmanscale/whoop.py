@@ -107,15 +107,19 @@ def _get(url: str, access_token: str) -> dict:
         return json.loads(resp.read())
 
 
-def fetch_latest_cycle_kcal() -> dict:
+def fetch_recent_closed_cycles(limit: int = 25) -> dict[str, float]:
     """
-    Returns {"kcal": float|None, "score_state": str, "date": "YYYY-MM-DD"}
-    for the most recent physiological cycle. kcal is None if the cycle
-    isn't fully scored yet (score_state != "SCORED") — caller should not
-    treat that as a hard failure, just tell the user to retry later.
+    Returns {"YYYY-MM-DD": kcal} for recent physiological cycles that are
+    fully closed (end is set, not still in progress) and fully scored.
+
+    Today's cycle is deliberately excluded: Whoop leaves `end` null while a
+    cycle is still running, so its kilojoule total is a partial, still-
+    climbing number, not a real daily total — syncing it would silently
+    write an incomplete day's expenditure into the DB. Only closed,
+    SCORED cycles are trustworthy as a "full day" value.
     """
     tokens = _load_tokens()
-    url = f"{CYCLE_URL}?limit=1"
+    url = f"{CYCLE_URL}?limit={limit}"
     try:
         data = _get(url, tokens["access_token"])
     except urllib.error.HTTPError as e:
@@ -125,15 +129,12 @@ def fetch_latest_cycle_kcal() -> dict:
         data = _get(url, tokens["access_token"])
 
     records = data.get("records", [])
-    if not records:
-        raise WhoopAuthError("No cycles returned from Whoop API.")
-
-    cycle = records[0]
-    score_state = cycle.get("score_state")
-    cycle_date = cycle["start"][:10]
-
-    if score_state != "SCORED":
-        return {"kcal": None, "score_state": score_state, "date": cycle_date}
-
-    kcal = cycle["score"]["kilojoule"] / KJ_PER_KCAL
-    return {"kcal": kcal, "score_state": score_state, "date": cycle_date}
+    by_date = {}
+    for cycle in records:
+        if cycle.get("end") is None:
+            continue  # still in progress — not a complete day
+        if cycle.get("score_state") != "SCORED":
+            continue
+        cycle_date = cycle["start"][:10]
+        by_date[cycle_date] = cycle["score"]["kilojoule"] / KJ_PER_KCAL
+    return by_date

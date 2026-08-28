@@ -60,7 +60,25 @@ def get_filter():
 
 @app.post("/api/whoop/sync")
 def whoop_sync():
+    """
+    Backfills cal_out for existing entries that are missing it, using
+    recent *closed* Whoop cycles only (never today's still-in-progress
+    cycle — see whoop.fetch_recent_closed_cycles). Never creates rows and
+    never overwrites a cal_out that's already set.
+    """
     try:
-        return whoop.fetch_latest_cycle_kcal()
+        by_date = whoop.fetch_recent_closed_cycles()
     except whoop.WhoopAuthError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    updated = []
+    for row in db.list_entries():
+        if row["cal_out"] is not None:
+            continue
+        kcal = by_date.get(row["date"])
+        if kcal is None:
+            continue
+        if db.backfill_cal_out(row["date"], kcal):
+            updated.append({"date": row["date"], "cal_out": kcal})
+
+    return {"updated": updated}

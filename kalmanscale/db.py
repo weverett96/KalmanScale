@@ -33,6 +33,18 @@ def upsert_entry(date_str: str, weight: float, cal_in: float | None, cal_out: fl
         )
 
 
+def backfill_cal_out(date_str: str, cal_out: float) -> bool:
+    """Fill cal_out only for an existing row where it's currently NULL.
+    Never overwrites an already-set value, never creates a new row.
+    Returns True if a row was actually updated."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE entries SET cal_out = ? WHERE date = ? AND cal_out IS NULL",
+            (cal_out, date_str),
+        )
+        return cur.rowcount > 0
+
+
 def delete_entry(date_str: str) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM entries WHERE date = ?", (date_str,))
