@@ -122,6 +122,14 @@ def exchange_code(code: str, client_id: str, client_secret: str) -> dict:
 
     req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Accept", "application/json")
+    # Whoop's API sits behind Cloudflare, which blocks the default
+    # urllib User-Agent as a bot fingerprint (403 / error code 1010).
+    req.add_header(
+        "User-Agent",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    )
 
     try:
         with urllib.request.urlopen(req) as resp:
