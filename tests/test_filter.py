@@ -87,3 +87,138 @@ def test_single_data_point_just_initializes():
     assert results[0]["x"] == pytest.approx(200.0)
     params = FilterParams()
     assert results[0]["se_x"] == pytest.approx(params.p0_x**0.5)
+
+
+def test_single_data_point_with_body_fat_initializes_fat_directly():
+    entries = [
+        {"date": date(2026, 1, 1), "weight": 200.0, "cal_in": None, "cal_out": None, "body_fat_pct": 25.0}
+    ]
+    results = run_filter(entries)
+    assert results[0]["fat"] == pytest.approx(50.0)  # 200 * 25%
+
+
+def test_fat_mass_recovered_with_intermittent_bioimpedance_readings():
+    # body_fat_pct is only logged ~1/3 of days (the point of this test: the
+    # filter must handle missing bioimpedance observations without special
+    # casing, same as it already does for missing calorie data).
+    n = 90
+    true_fat = 60.0  # lb, held constant
+    weight = 200.0
+    dates = _dates(n)
+    rng = np.random.default_rng(2)
+
+    entries = []
+    for i in range(n):
+        entry = {"date": dates[i], "weight": weight, "cal_in": None, "cal_out": None}
+        if rng.random() < (1 / 3):
+            noisy_fat = true_fat + rng.normal(0, 5.0)
+            entry["body_fat_pct"] = noisy_fat / weight * 100.0
+        else:
+            entry["body_fat_pct"] = None
+        entries.append(entry)
+
+    results = run_filter(entries)
+    assert results[-1]["fat"] == pytest.approx(true_fat, abs=3.0)
+
+
+def test_fat_uncertainty_grows_when_bioimpedance_missing_then_shrinks_on_reading():
+    entries = [
+        {"date": date(2026, 1, 1), "weight": 200.0, "cal_in": None, "cal_out": None, "body_fat_pct": 25.0},
+        {"date": date(2026, 1, 2), "weight": 200.0, "cal_in": None, "cal_out": None, "body_fat_pct": None},
+        {"date": date(2026, 1, 3), "weight": 200.0, "cal_in": None, "cal_out": None, "body_fat_pct": None},
+        {"date": date(2026, 1, 4), "weight": 200.0, "cal_in": None, "cal_out": None, "body_fat_pct": None},
+        {"date": date(2026, 1, 5), "weight": 200.0, "cal_in": None, "cal_out": None, "body_fat_pct": 26.0},
+    ]
+    results = run_filter(entries)
+    se_fat = [r["se_fat"] for r in results]
+    # Strictly grows across the unobserved stretch (days 2-4)...
+    assert se_fat[1] < se_fat[2] < se_fat[3]
+    # ...and shrinks back down once a reading arrives again on day 5.
+    assert se_fat[4] < se_fat[3]
+
+
+def test_matches_pre_bioimpedance_filter_when_body_fat_never_provided():
+    """Regression test: adding the fat_t state must not perturb x/beta/b/e
+    at all when body_fat_pct is absent throughout. Cross-checks against a
+    frozen reimplementation of the original 4-state filter math."""
+
+    def old_filter(entries, params):
+        KCAL_PER_LB = 3500.0
+
+        def F(phi, with_control):
+            b_term = -1.0 / KCAL_PER_LB if with_control else 0.0
+            return np.array(
+                [
+                    [1.0, 1.0, b_term, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, phi],
+                ]
+            )
+
+        H = np.array([1.0, 0.0, 0.0, 1.0])
+        B = np.array([1.0 / KCAL_PER_LB, 0.0, 0.0, 0.0])
+        Q = np.diag([params.q_x, params.q_beta, params.q_b, params.q_e])
+        R = params.r
+
+        first = entries[0]
+        x = np.array([first["weight"], 0.0, 0.0, 0.0])
+        P = np.diag([params.p0_x, params.p0_beta, params.p0_b, params.p0_e])
+        out = [(x.copy(), P.copy())]
+        prev_date = first["date"]
+
+        for e in entries[1:]:
+            gap_days = (e["date"] - prev_date).days
+            F0 = F(params.phi, with_control=False)
+            for _ in range(gap_days - 1):
+                x = F0 @ x
+                P = F0 @ P @ F0.T + Q
+            have_cal = e.get("cal_in") is not None and e.get("cal_out") is not None
+            if have_cal:
+                Fm = F(params.phi, with_control=True)
+                u = e["cal_in"] - e["cal_out"]
+            else:
+                Fm = F0
+                u = 0.0
+            x = Fm @ x + B * u
+            P = Fm @ P @ Fm.T + Q
+            z = e["weight"]
+            y = z - H @ x
+            S = H @ P @ H + R
+            K = (P @ H) / S
+            x = x + K * y
+            P = P - np.outer(K, H @ P)
+            out.append((x.copy(), P.copy()))
+            prev_date = e["date"]
+        return out
+
+    n = 60
+    dates = _dates(n)
+    rng = np.random.default_rng(3)
+    cal_out = 2800 + rng.normal(0, 250, n)
+    cal_in = 2800 + rng.normal(0, 250, n)
+    weight = 200.0
+    weights = []
+    for i in range(n):
+        weight += rng.normal(0, 0.1)
+        weights.append(weight + rng.normal(0, 0.3))
+
+    entries = [
+        {"date": dates[i], "weight": weights[i], "cal_in": cal_in[i], "cal_out": cal_out[i]}
+        for i in range(n)
+    ]
+
+    params = FilterParams()
+    new_results = run_filter(entries, params)
+    old_results = old_filter(entries, params)
+
+    for new_r, (old_x, old_P) in zip(new_results, old_results):
+        old_se = np.sqrt(np.diag(old_P))
+        assert new_r["x"] == pytest.approx(old_x[0])
+        assert new_r["beta"] == pytest.approx(old_x[1])
+        assert new_r["b"] == pytest.approx(old_x[2])
+        assert new_r["e"] == pytest.approx(old_x[3])
+        assert new_r["se_x"] == pytest.approx(old_se[0])
+        assert new_r["se_beta"] == pytest.approx(old_se[1])
+        assert new_r["se_b"] == pytest.approx(old_se[2])
+        assert new_r["se_e"] == pytest.approx(old_se[3])

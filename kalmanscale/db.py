@@ -13,23 +13,38 @@ CREATE TABLE IF NOT EXISTS entries (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
+    if "body_fat_pct" not in columns:
+        conn.execute("ALTER TABLE entries ADD COLUMN body_fat_pct REAL")
+
+
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(_SCHEMA)
+    _migrate(conn)
     return conn
 
 
-def upsert_entry(date_str: str, weight: float, cal_in: float | None, cal_out: float | None) -> None:
+def upsert_entry(
+    date_str: str,
+    weight: float,
+    cal_in: float | None,
+    cal_out: float | None,
+    body_fat_pct: float | None = None,
+) -> None:
     with _conn() as conn:
         conn.execute(
             """
-            INSERT INTO entries (date, weight, cal_in, cal_out) VALUES (?, ?, ?, ?)
+            INSERT INTO entries (date, weight, cal_in, cal_out, body_fat_pct)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(date) DO UPDATE SET
                 weight = excluded.weight,
                 cal_in = excluded.cal_in,
-                cal_out = excluded.cal_out
+                cal_out = excluded.cal_out,
+                body_fat_pct = excluded.body_fat_pct
             """,
-            (date_str, weight, cal_in, cal_out),
+            (date_str, weight, cal_in, cal_out, body_fat_pct),
         )
 
 
@@ -53,8 +68,15 @@ def delete_entry(date_str: str) -> None:
 def list_entries() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT date, weight, cal_in, cal_out FROM entries ORDER BY date ASC"
+            "SELECT date, weight, cal_in, cal_out, body_fat_pct FROM entries ORDER BY date ASC"
         ).fetchall()
     return [
-        {"date": r[0], "weight": r[1], "cal_in": r[2], "cal_out": r[3]} for r in rows
+        {
+            "date": r[0],
+            "weight": r[1],
+            "cal_in": r[2],
+            "cal_out": r[3],
+            "body_fat_pct": r[4],
+        }
+        for r in rows
     ]

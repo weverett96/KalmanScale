@@ -14,6 +14,7 @@ const dateInput = document.getElementById("date");
 const weightInput = document.getElementById("weight");
 const calInInput = document.getElementById("cal_in");
 const calOutInput = document.getElementById("cal_out");
+const bodyFatInput = document.getElementById("body_fat_pct");
 const syncStatus = document.getElementById("sync-status");
 const statsEl = document.getElementById("stats");
 
@@ -22,6 +23,7 @@ function loadFormForDate(dateStr) {
   weightInput.value = entry ? entry.weight : "";
   calInInput.value = entry && entry.cal_in !== null ? entry.cal_in : "";
   calOutInput.value = entry && entry.cal_out !== null ? entry.cal_out : "";
+  bodyFatInput.value = entry && entry.body_fat_pct !== null ? entry.body_fat_pct : "";
 }
 
 dateInput.valueAsDate = new Date();
@@ -50,6 +52,7 @@ document.getElementById("entry-form").addEventListener("submit", async (ev) => {
     weight: parseFloat(weightInput.value),
     cal_in: calInInput.value ? parseFloat(calInInput.value) : null,
     cal_out: calOutInput.value ? parseFloat(calOutInput.value) : null,
+    body_fat_pct: bodyFatInput.value ? parseFloat(bodyFatInput.value) : null,
   };
   await api("/api/entries", {
     method: "POST",
@@ -84,8 +87,9 @@ function renderStats(latest) {
       ${stat("Trend (&beta;)", `${betaWk} lb/wk`, `&plusmn;${betaSeWk}/wk &middot; ${distinguishable ? "distinguishable from zero" : "not yet distinguishable from zero"}`)}
       ${stat("Bias (b)", `${latest.b.toFixed(0)} kcal/day`, `&plusmn;${latest.se_b.toFixed(0)}`)}
       ${stat("Water-weight (e)", `${latest.e.toFixed(2)} lb`, "AR(1) transient")}
+      ${stat("Fat mass", `${latest.fat.toFixed(1)} lb`, `&plusmn;${latest.se_fat.toFixed(1)} &middot; from Garmin Index bioimpedance`)}
     </div>
-    <div class="caveat">&beta; may reflect residual/unexplained trend rather than the whole trend, since tracked calorie balance already explains most calorie-driven change — see plan Section 6.</div>
+    <div class="caveat">&beta; may reflect residual/unexplained trend rather than the whole trend, since tracked calorie balance already explains most calorie-driven change — see plan Section 6. Fat mass is currently an independent estimate, not yet coupled into the weight/trend dynamics.</div>
   `;
 }
 
@@ -128,7 +132,7 @@ function renderTable(entries) {
   for (const e of [...entries].reverse()) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${e.date}</td><td>${e.weight}</td><td>${e.cal_in ?? ""}</td><td>${e.cal_out ?? ""}</td>
+      <td>${e.date}</td><td>${e.weight}</td><td>${e.cal_in ?? ""}</td><td>${e.cal_out ?? ""}</td><td>${e.body_fat_pct ?? ""}</td>
       <td><button class="icon" title="Delete" data-date="${e.date}">&times;</button></td>
     `;
     tr.querySelector("button").addEventListener("click", () => deleteEntry(e.date));

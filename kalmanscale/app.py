@@ -20,6 +20,7 @@ class EntryIn(BaseModel):
     weight: float
     cal_in: float | None = None
     cal_out: float | None = None
+    body_fat_pct: float | None = None
 
 
 @app.get("/")
@@ -39,7 +40,7 @@ def get_entries():
 
 @app.post("/api/entries")
 def upsert_entry(entry: EntryIn):
-    db.upsert_entry(entry.date, entry.weight, entry.cal_in, entry.cal_out)
+    db.upsert_entry(entry.date, entry.weight, entry.cal_in, entry.cal_out, entry.body_fat_pct)
     return {"ok": True}
 
 
@@ -58,6 +59,7 @@ def get_filter():
             "weight": r["weight"],
             "cal_in": r["cal_in"],
             "cal_out": r["cal_out"],
+            "body_fat_pct": r["body_fat_pct"],
         }
         for r in rows
     ]
