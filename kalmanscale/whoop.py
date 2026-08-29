@@ -107,10 +107,12 @@ def _get(url: str, access_token: str) -> dict:
         return json.loads(resp.read())
 
 
-def fetch_recent_closed_cycles(limit: int = 25) -> dict[str, float]:
+def fetch_recent_closed_cycles(limit: int = 25) -> dict[str, int]:
     """
     Returns {"YYYY-MM-DD": kcal} for recent physiological cycles that are
     fully closed (end is set, not still in progress) and fully scored.
+    kcal is rounded to the nearest whole calorie (matches the cal_out
+    number input's step=1 in the frontend).
 
     Today's cycle is deliberately excluded: Whoop leaves `end` null while a
     cycle is still running, so its kilojoule total is a partial, still-
@@ -136,5 +138,5 @@ def fetch_recent_closed_cycles(limit: int = 25) -> dict[str, float]:
         if cycle.get("score_state") != "SCORED":
             continue
         cycle_date = cycle["start"][:10]
-        by_date[cycle_date] = cycle["score"]["kilojoule"] / KJ_PER_KCAL
+        by_date[cycle_date] = round(cycle["score"]["kilojoule"] / KJ_PER_KCAL)
     return by_date
