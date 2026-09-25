@@ -83,7 +83,7 @@ KCAL_PER_LB = 3500.0
 class FilterParams:
     q_fat: float = 0.002   # process noise var, fat mass (lb^2/day)
     q_lean: float = 0.018  # process noise var, lean mass (lb^2/day); q_fat + q_lean = old q_x
-    q_beta: float = 1e-5   # process noise var, total drift ((lb/day)^2/day)
+    q_beta: float = 1e-4   # process noise var, total drift ((lb/day)^2/day); ~2 wk to register a diet change
     q_dbeta: float = 1e-7  # process noise var, fat/lean drift split deviation
     q_kappa: float = 1e-4  # process noise var, total ride-kcal retention (1/day)
     q_dkappa: float = 1e-5 # process noise var, fat/lean ride split deviation

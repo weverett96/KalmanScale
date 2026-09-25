@@ -92,8 +92,8 @@ def test_kappa_not_identifiable_with_constant_rides():
     entries = [{"date": dates[i], "weight": weights[i]} for i in range(n)]
     final = run_filter(entries, {d: A for d in dates})[-1]
 
-    combined = final["beta"] - final["kappa"] * A / 3500.0
-    assert combined == pytest.approx(true_beta - true_kappa * A / 3500.0, abs=0.01)
+    combined, se_combined = projected_trend(final, A)
+    assert combined == pytest.approx(true_beta - true_kappa * A / 3500.0, abs=3 * se_combined)
     assert final["se_kappa"] > 0.5 * FilterParams().p0_kappa**0.5
 
 
