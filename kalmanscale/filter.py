@@ -1,34 +1,49 @@
 """
-6-state Kalman filter for weight trend estimation.
+8-state Kalman filter for weight trend estimation, with weight split into
+fat and lean mass, each with its own drift and ride response.
 
-State vector s_t = [x_t, beta_t, kappa_t, e_t, fat_t, btape_t]:
-  x_t      true weight (lb)
-  beta_t   baseline drift (lb/day): average intake minus non-ride
-           expenditure, i.e. what weight does on a day with no riding
-  kappa_t  fraction of ride kcal that actually shows up as a deficit
-           (i.e. not eaten back); slow random walk
-  e_t      AR(1) autocorrelated scale-noise component (sodium/glycogen/GI)
-  fat_t    true fat mass (lb), on the Garmin Index bioimpedance scale
-  btape_t  constant offset (lb of fat mass) between tape-measure (US Navy
-           formula) body fat and the Index — the Index is the reference,
-           so this absorbs the method gap; slow random walk
+State vector s_t = [F, L, beta_F, beta_L, kappa_F, kappa_L, e, btape]:
+  F, L        fat and lean mass (lb). Fat is on the Garmin Index
+              bioimpedance scale; lean is everything else, excluding the
+              transient water in e. True weight is F + L.
+  beta_F/L    baseline fat / lean drift (lb/day) on a day with no riding.
+              beta = beta_F + beta_L is the total baseline drift.
+  kappa_F/L   fat / lean share of ride kcal that shows up as a deficit
+              (i.e. not eaten back). kappa = kappa_F + kappa_L.
+  e           AR(1) autocorrelated scale-noise component (sodium/glycogen/GI)
+  btape       constant offset (lb of fat mass) between tape-measure (US Navy
+              formula) body fat and the Index — the Index is the reference,
+              so this absorbs the method gap; slow random walk
 
-Transition, with A_{t-1} = the previous calendar day's ride kcal (a morning
-weigh-in reflects yesterday's ride, not today's):
+Transition, with a = A_{t-1} / 3500 and A_{t-1} = the previous calendar
+day's ride kcal (a morning weigh-in reflects yesterday's ride):
 
-  x_t = x_{t-1} + beta_{t-1} - kappa_{t-1} * A_{t-1} / 3500
+  F_t = F_{t-1} + beta_F - kappa_F * a
+  L_t = L_{t-1} + beta_L - kappa_L * a
 
-A_{t-1} is a known input, so this is still linear in the state — F just
-varies per day. A day with no ride is A = 0, not missing data.
+Linear in the state (A is a known input; F just varies per day). The fat
+share of change is never a state — it emerges as beta_F / beta and
+kappa_F / kappa, so it can differ between baseline and ride-driven change
+and drift over time.
 
-fat_t is currently a bolt-on, uncoupled random walk (Option A) — it has no
-interaction with x/beta/kappa/e. It's measured by the Index (fat) and, on
-tape days, by the Navy formula (fat + btape). Coupling it into the weight dynamics
-(Option B, e.g. splitting x_t into fat + lean/water) is a deliberate future
-step, not done here; see plans/KalmanScale_v1.md Section 3.
+Priors and process noise are built in (total, deviation) coordinates:
+  beta_F = p * beta + d_beta,   beta_L = (1 - p) * beta - d_beta
+(same for kappa), with independent variances on the total and on the
+deviation d. The totals get exactly the old unsplit model's variances, and
+the deviation starts small, so the filter begins as a fixed-p split and
+only moves off p as fat readings demand it. With the deviation variances
+set to 0 it *is* the fixed-p model.
 
-See plans/KalmanScale_v1.md Section 3 for the core derivation. Default
-params below are placeholders (Milestone 6: tune against real data).
+Measurements:
+  scale   z = F + L + e
+  Index   z = F + c * e     (c: fixed water loading of bioimpedance)
+  tape    z = F + btape
+
+With no fat readings, F + L, beta and kappa evolve exactly like the old
+unsplit filter (q_fat + q_lean = q_x) — weight alone can't see the split.
+
+See plans/KalmanScale_v1.md Section 3 for the derivation. Default params
+below are placeholders (Milestone 6: tune against real data).
 """
 
 from dataclasses import dataclass
@@ -42,64 +57,104 @@ KCAL_PER_LB = 3500.0
 
 @dataclass
 class FilterParams:
-    q_x: float = 0.02      # process noise var, weight (lb^2/day)
-    q_beta: float = 1e-5   # process noise var, trend ((lb/day)^2/day)
-    q_kappa: float = 1e-4  # process noise var, ride-kcal retention (1/day)
+    q_fat: float = 0.002   # process noise var, fat mass (lb^2/day)
+    q_lean: float = 0.018  # process noise var, lean mass (lb^2/day); q_fat + q_lean = old q_x
+    q_beta: float = 1e-5   # process noise var, total drift ((lb/day)^2/day)
+    q_dbeta: float = 1e-7  # process noise var, fat/lean drift split deviation
+    q_kappa: float = 1e-4  # process noise var, total ride-kcal retention (1/day)
+    q_dkappa: float = 1e-5 # process noise var, fat/lean ride split deviation
     q_e: float = 0.05      # process noise var, AR(1) transient (lb^2)
-    q_fat: float = 0.01    # process noise var, fat mass (lb^2/day)
+    q_btape: float = 1e-3  # process noise var, tape-vs-Index offset (lb^2/day)
     phi: float = 0.7       # AR(1) persistence of water-weight component
+    p_fat: float = 0.75    # prior fat share of weight change
+    c_water: float = 0.0   # bioimpedance fat-mass loading on e (unestimated)
     r: float = 0.09        # measurement noise var, white residual (lb^2)
     r_fat: float = 25.0    # measurement noise var, bioimpedance fat mass (lb^2)
-    q_btape: float = 1e-3  # process noise var, tape-vs-Index offset (lb^2/day)
     r_tape: float = 1.0    # measurement noise var, tape fat mass (lb^2): ±0.25 in ≈ ±1 lb
-    kappa0: float = 0.5    # prior mean for kappa (weakly informative)
-    p0_x: float = 1.0      # initial covariance
-    p0_beta: float = 0.01
-    p0_kappa: float = 0.25
+    kappa0: float = 0.5    # prior mean for total kappa (weakly informative)
+    fat_frac0: float = 0.25  # initial fat fraction when day 1 has no Index reading
+    p0_x: float = 1.0      # initial covariance: total weight
+    p0_fat: float = 100.0  # fat (total-weight and fat priors are independent)
+    p0_beta: float = 0.01  # total drift
+    p0_dbeta: float = 4e-4 # split deviation, SD 0.02 lb/day (~0.14 lb/wk)
+    p0_kappa: float = 0.25 # total kappa
+    p0_dkappa: float = 0.01  # split deviation, SD 0.1
     p0_e: float = 1.0
-    p0_fat: float = 100.0
     p0_btape: float = 225.0  # SD 15 lb: Navy vs BIA can differ by several % BF
 
 
-# State order: [x, beta, kappa, e, fat, btape]
-_H_WEIGHT = np.array([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
-_H_FAT = np.array([0.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-_H_TAPE = np.array([0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
+# State order: [F, L, beta_F, beta_L, kappa_F, kappa_L, e, btape]
+N_STATES = 8
+_H_WEIGHT = np.array([1.0, 1.0, 0, 0, 0, 0, 1.0, 0])
+_H_TAPE = np.array([1.0, 0, 0, 0, 0, 0, 0, 1.0])
+_TOTAL = np.array([1.0, 1.0, 0, 0, 0, 0, 0, 0])
 
 
-def _F(phi: float, ride_kcal: float) -> np.ndarray:
-    return np.array(
-        [
-            [1.0, 1.0, -ride_kcal / KCAL_PER_LB, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, phi, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        ]
-    )
+def _H_fat(c_water: float) -> np.ndarray:
+    return np.array([1.0, 0, 0, 0, 0, 0, c_water, 0])
+
+
+def _split(p: float) -> np.ndarray:
+    """Maps (total, deviation) -> (fat part, lean part)."""
+    return np.array([[p, 1.0], [1.0 - p, -1.0]])
+
+
+def _split_cov(p: float, var_total: float, var_dev: float) -> np.ndarray:
+    M = _split(p)
+    return M @ np.diag([var_total, var_dev]) @ M.T
+
+
+def _F(params: "FilterParams", ride_kcal: float) -> np.ndarray:
+    a = ride_kcal / KCAL_PER_LB
+    F = np.eye(N_STATES)
+    F[0, 2], F[0, 4] = 1.0, -a
+    F[1, 3], F[1, 5] = 1.0, -a
+    F[6, 6] = params.phi
+    return F
+
+
+def _Q(params: "FilterParams") -> np.ndarray:
+    Q = np.zeros((N_STATES, N_STATES))
+    Q[0, 0], Q[1, 1] = params.q_fat, params.q_lean
+    Q[2:4, 2:4] = _split_cov(params.p_fat, params.q_beta, params.q_dbeta)
+    Q[4:6, 4:6] = _split_cov(params.p_fat, params.q_kappa, params.q_dkappa)
+    Q[6, 6], Q[7, 7] = params.q_e, params.q_btape
+    return Q
+
+
+def _vec(*idx) -> np.ndarray:
+    v = np.zeros(N_STATES)
+    v[list(idx)] = 1.0
+    return v
+
+
+# Linear readouts: (value vector) for reported quantities.
+_READOUTS = {
+    "fat": _vec(0),
+    "lean": _vec(1),
+    "x": _TOTAL,
+    "beta": _vec(2, 3),
+    "beta_fat": _vec(2),
+    "beta_lean": _vec(3),
+    "kappa": _vec(4, 5),
+    "kappa_fat": _vec(4),
+    "kappa_lean": _vec(5),
+    "e": _vec(6),
+    "btape": _vec(7),
+}
 
 
 def _state_result(day, x: np.ndarray, P: np.ndarray) -> dict:
-    se = np.sqrt(np.diag(P))
-    beta, se_beta = float(x[1]), float(se[1])
-    return {
-        "date": day.isoformat() if isinstance(day, Date) else day,
-        "x": float(x[0]),
-        "beta": beta,
-        "kappa": float(x[2]),
-        "e": float(x[3]),
-        "fat": float(x[4]),
-        "btape": float(x[5]),
-        "se_x": float(se[0]),
-        "se_beta": se_beta,
-        "se_kappa": float(se[2]),
-        "se_e": float(se[3]),
-        "se_fat": float(se[4]),
-        "se_btape": float(se[5]),
-        "beta_z": beta / se_beta if se_beta > 0 else 0.0,
-        "cov_beta_kappa": float(P[1, 2]),
-    }
+    out = {"date": day.isoformat() if isinstance(day, Date) else day}
+    for name, v in _READOUTS.items():
+        out[name] = float(v @ x)
+        out[f"se_{name}"] = float(np.sqrt(max(v @ P @ v, 0.0)))
+    for part in ("", "_fat", "_lean"):
+        out[f"cov_beta_kappa{part}"] = float(
+            _READOUTS[f"beta{part}"] @ P @ _READOUTS[f"kappa{part}"]
+        )
+    out["beta_z"] = out["beta"] / out["se_beta"] if out["se_beta"] > 0 else 0.0
+    return out
 
 
 def navy_body_fat_pct(abdomen_in: float, neck_in: float, height_in: float) -> float:
@@ -145,22 +200,24 @@ def forecast_ride_kcal(
     return num / den
 
 
-def projected_trend(latest: dict, ride_kcal_per_day: float) -> tuple[float, float]:
+def projected_trend(
+    latest: dict, ride_kcal_per_day: float, part: str = ""
+) -> tuple[float, float]:
     """(trend, se) in lb/day: beta plus the ride term at the forecast ride
     volume, beta - kappa * A / 3500, with the beta/kappa covariance in the
-    SE."""
+    SE. part is "" for total weight, "_fat" or "_lean" for one component."""
     a = ride_kcal_per_day / KCAL_PER_LB
-    trend = latest["beta"] - latest["kappa"] * a
+    trend = latest[f"beta{part}"] - latest[f"kappa{part}"] * a
     var = (
-        latest["se_beta"] ** 2
-        + (a * latest["se_kappa"]) ** 2
-        - 2 * a * latest["cov_beta_kappa"]
+        latest[f"se_beta{part}"] ** 2
+        + (a * latest[f"se_kappa{part}"]) ** 2
+        - 2 * a * latest[f"cov_beta_kappa{part}"]
     )
     return trend, float(np.sqrt(max(var, 0.0)))
 
 
 def _update(x: np.ndarray, P: np.ndarray, H: np.ndarray, R: np.ndarray, z: np.ndarray):
-    """General KF update for an n-row measurement (H is (n,6), R is (n,n))."""
+    """General KF update for an n-row measurement (H is (n,8), R is (n,n))."""
     y = z - H @ x
     S = H @ P @ H.T + R
     K = P @ H.T @ np.linalg.inv(S)
@@ -180,8 +237,8 @@ def run_filter(
     or None) and 'tape_bf_pct' (Navy-formula body fat %, or None).
     Either body-fat % is converted to a derived fat-mass measurement
     (weight * pct / 100) using that day's weight — so a tape reading only
-    counts on a day with a weigh-in. body_fat_pct updates fat_t,
-    tape_bf_pct updates fat_t + btape_t; with neither, fat_t is
+    counts on a day with a weigh-in. body_fat_pct measures F (+ c*e),
+    tape_bf_pct measures F + btape; with neither, the F/L split is
     predict-only for that day.
 
     ride_kcal_by_date: {date: total ride kcal that day}. Days not present
@@ -200,27 +257,29 @@ def run_filter(
     if not entries:
         return []
 
-    Q = np.diag(
-        [params.q_x, params.q_beta, params.q_kappa, params.q_e, params.q_fat, params.q_btape]
-    )
+    Q = _Q(params)
 
     # First entry: initialize directly from the measurement (no KF update —
     # a single data point should initialize, not update; see the "single
     # data point" edge case in plans/KalmanScale_v1.md Section 3).
     first = entries[0]
-    first_bf_pct = first.get("body_fat_pct")
-    fat0 = first["weight"] * first_bf_pct / 100.0 if first_bf_pct is not None else 0.0
-    x = np.array([first["weight"], 0.0, params.kappa0, 0.0, fat0, 0.0])
-    P = np.diag(
-        [
-            params.p0_x,
-            params.p0_beta,
-            params.p0_kappa,
-            params.p0_e,
-            params.p0_fat,
-            params.p0_btape,
-        ]
+    weight0 = first["weight"]
+    bf0 = first.get("body_fat_pct")
+    fat0 = weight0 * (bf0 / 100.0 if bf0 is not None else params.fat_frac0)
+    p = params.p_fat
+    x = np.array(
+        [fat0, weight0 - fat0, 0.0, 0.0, p * params.kappa0, (1 - p) * params.kappa0, 0.0, 0.0]
     )
+    P = np.zeros((N_STATES, N_STATES))
+    # Independent priors on total weight (p0_x) and fat (p0_fat), mapped
+    # into [F, L] = [F, total - F]: var(L) = p0_x + p0_fat, cov(F, L) = -p0_fat.
+    # This keeps F + L's prior at exactly p0_x, matching the unsplit model.
+    P[0, 0] = params.p0_fat
+    P[1, 1] = params.p0_x + params.p0_fat
+    P[0, 1] = P[1, 0] = -params.p0_fat
+    P[2:4, 2:4] = _split_cov(p, params.p0_beta, params.p0_dbeta)
+    P[4:6, 4:6] = _split_cov(p, params.p0_kappa, params.p0_dkappa)
+    P[6, 6], P[7, 7] = params.p0_e, params.p0_btape
 
     results = [_state_result(first["date"], x, P)]
     prev_date = first["date"]
@@ -237,7 +296,7 @@ def run_filter(
         # skipped days are predict-only (e decays, fat randomly walks).
         for k in range(gap_days):
             ride_kcal = ride_kcal_by_date.get(prev_date + timedelta(days=k), 0.0)
-            F = _F(params.phi, ride_kcal)
+            F = _F(params, ride_kcal)
             x = F @ x
             P = F @ P @ F.T + Q
 
@@ -257,7 +316,7 @@ def _apply_measurement(x, P, e: dict, params: FilterParams):
 
     bf_pct = e.get("body_fat_pct")
     if bf_pct is not None:
-        rows.append(_H_FAT)
+        rows.append(_H_fat(params.c_water))
         noise.append(params.r_fat)
         z.append(weight * bf_pct / 100.0)
 

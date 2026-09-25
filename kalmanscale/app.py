@@ -94,8 +94,11 @@ def get_filter():
         rides, entries[0]["date"], entries[-1]["date"] - timedelta(days=1)
     )
     if ride_kcal is not None:
-        trend, se_trend = projected_trend(latest, ride_kcal)
-        latest.update(ride_kcal_forecast=ride_kcal, trend=trend, se_trend=se_trend)
+        latest["ride_kcal_forecast"] = ride_kcal
+        for part in ("", "_fat", "_lean"):
+            trend, se_trend = projected_trend(latest, ride_kcal, part)
+            latest[f"trend{part}"] = trend
+            latest[f"se_trend{part}"] = se_trend
     return {"trajectory": results, "latest": latest}
 
 

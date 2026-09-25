@@ -58,7 +58,38 @@ Still linear in the state (4x4 $F$ now, with $\phi$ in the $(4,4)$ entry), so a 
 
 **Garmin Index bioimpedance (implemented 2026-08-29):** a 5th state $fat_t$ (true fat mass, lb) was added, sourced from the Garmin Index scale's body-fat % reading. Currently **Option A**: $fat_t = fat_{t-1} + \zeta_t$, $\zeta_t \sim N(0, q_{fat})$ — a bolt-on random walk, uncoupled from $x/\beta/b/e$, updated from a derived measurement $z_{fat} = \text{weight} \times \text{body\_fat\_pct}/100$ only on days a reading exists (missing days are predict-only, same pattern as $e_t$ across gaps — verified in `tests/test_filter.py`). Raw BMI was considered and rejected as a data source since it's a fixed multiple of weight already logged, carrying no new information.
 
-**Option B (not yet implemented, the actual point of adding this):** couple $fat_t$ into the weight dynamics — e.g. split $x_t$ into fat + lean/water components so bioimpedance helps de-confound the $\beta$/$b$ identifiability problem above, since fat mass tracks caloric balance more directly than raw scale weight does. Deferred because it requires restructuring the state relationships, not just appending a state, and BIA readings are themselves hydration-sensitive (arguably more so than the scale) — that correlation with $e_t$ needs deliberate handling or the two noisy signals will just confuse each other. Fat mass (not raw body-fat %) was chosen as the unit specifically so this extension is incremental rather than a rewrite.
+**Tape measure + Option B (implemented 2026-09-25).**
+
+*Tape.* Abdomen circumference, measured at the navel, syncs from intervals.icu's `abdomen` wellness field. The API returns it in cm. Height and neck are page settings with no history. The US Navy formula for men turns these into body fat %, which becomes a fat-mass reading using that day's weight:
+
+$$BF\% = 86.010\log_{10}(\text{abd} - \text{neck}) - 70.041\log_{10}(\text{height}) + 36.76$$
+
+A ±0.25 in tape error is about ±1 lb of fat mass, versus about ±5 lb for bioimpedance. A slow state $b_{tape}$ absorbs the constant gap between the Navy formula and the Index; the Index is the reference scale. On the first reading, 2026-09-25, Navy came out about 12 lb of fat mass above the Index.
+
+*Option B.* State is now $[F, L, \beta_F, \beta_L, \kappa_F, \kappa_L, e, b_{tape}]$, with true weight $= F + L$. With $a = A_{t-1}/3500$:
+
+$$F_t = F_{t-1} + \beta_F - \kappa_F\,a, \qquad L_t = L_{t-1} + \beta_L - \kappa_L\,a$$
+
+Fat and lean each get their own baseline drift and their own ride response, and all four are learned. It's still linear, because $A$ is a known input.
+
+The fat share of weight change is never a state. It emerges as $\beta_F/\beta$ for baseline change and $\kappa_F/\kappa$ for ride-driven change. That lets it differ between the two, since rides move glycogen and muscle, and drift over time. An earlier draft used a fixed share $p$ with $F \mathrel{+}= p\Delta$; treating $p$ itself as a state would need an EKF, because $p\cdot\beta$ is bilinear, and this reparametrization avoids that.
+
+*Priors.* Priors and process noise are built in (total, deviation) coordinates: $\beta_F = p\beta + d$ and $\beta_L = (1-p)\beta - d$, and the same for $\kappa$. The totals get exactly the old unsplit variances, and the deviation starts small (SD 0.02 lb/day for $\beta$, 0.1 for $\kappa$). So the filter begins as a $p = 0.75$ split and moves off it only as fat readings demand. With the deviation variances at 0 it reproduces the fixed-$p$ model exactly; `test_zero_split_deviation_is_exactly_fixed_p_model` checks this.
+
+*Learning speed.* On synthetic recomposition data (fat −0.56, lean +0.21 lb/wk), with weekly tape and daily Index readings:
+- fat drift is about right by 90 days;
+- lean drift takes about a year to move fully off its prior (+0.05 ± 0.11 lb/wk at 90 days, +0.21 ± 0.06 at 365).
+
+*Measurements:*
+- scale: $z = F + L + e$
+- Index: $z = F + c\,e$
+- tape: $z = F + b_{tape}$
+
+$c$ is the Index's water loading, the deliberate handling of hydration sensitivity called for below. It defaults to 0 and should be estimated from Index residuals against $e$.
+
+With no fat readings, $F + L$, $\beta$ and $\kappa$ reduce exactly to the unsplit filter when $q_F + q_L = q_x$; `test_matches_reference_implementation` checks this. The page reports total, fat and lean trends, each projected at the forecast ride volume.
+
+*Original motivation, kept for history:* Option B (the actual point of adding this): couple $fat_t$ into the weight dynamics — e.g. split $x_t$ into fat + lean/water components so bioimpedance helps de-confound the $\beta$/$b$ identifiability problem above, since fat mass tracks caloric balance more directly than raw scale weight does. Deferred because it requires restructuring the state relationships, not just appending a state, and BIA readings are themselves hydration-sensitive (arguably more so than the scale) — that correlation with $e_t$ needs deliberate handling or the two noisy signals will just confuse each other. Fat mass (not raw body-fat %) was chosen as the unit specifically so this extension is incremental rather than a rewrite.
 
 **Why this matters:** with only white $\eta_t$, the filter's posterior SE on $\beta$ reads more confident than it should, because it can't distinguish "true trend" from "still riding out Tuesday's high-sodium dinner." Separating $e_t$ out lets the filter correctly attribute a multi-day run of readings in one direction to a decaying transient rather than folding it into $\beta$ or $b$.
 

@@ -195,13 +195,14 @@ def test_fat_uncertainty_grows_when_bioimpedance_missing_then_shrinks_on_reading
 
 
 def test_matches_reference_implementation():
-    """Cross-checks run_filter (weight-only days, with rides and a gap)
-    against a frozen, independently written 4-state [x, beta, kappa, e]
-    filter — fat is uncoupled, so it must not perturb the other states."""
+    """Reduction test: with no fat readings, the Option B fat/lean split must
+    reproduce a frozen, independently written unsplit [x, beta, kappa, e]
+    filter exactly (x = F + L, q_x = q_fat + q_lean) — weight alone can't
+    see the split."""
 
     def reference(entries, rides, params):
         H = np.array([1.0, 0.0, 0.0, 1.0])
-        Q = np.diag([params.q_x, params.q_beta, params.q_kappa, params.q_e])
+        Q = np.diag([params.q_fat + params.q_lean, params.q_beta, params.q_kappa, params.q_e])
         first = entries[0]
         x = np.array([first["weight"], 0.0, params.kappa0, 0.0])
         P = np.diag([params.p0_x, params.p0_beta, params.p0_kappa, params.p0_e])
@@ -309,14 +310,141 @@ def test_tape_readings_tighten_fat_estimate():
     assert with_tape["se_fat"] < bia_only["se_fat"]
 
 
-def test_tape_only_touches_fat_and_offset():
-    # Option A: fat/btape are uncoupled, so a tape reading must not move
-    # x/beta/kappa/e or their SEs.
-    base = [{"date": d, "weight": 200.0 - 0.1 * i} for i, d in enumerate(_dates(10))]
+def test_fat_readings_inform_beta():
+    # Option B: fat observations constrain delta = beta - kappa*A/3500 via
+    # p, so adding weekly tape readings must tighten beta.
+    base = [{"date": d, "weight": 200.0 - 0.1 * i} for i, d in enumerate(_dates(60))]
     with_tape = [dict(e) for e in base]
-    with_tape[5]["tape_bf_pct"] = 28.0  # no Index reading that day
-    rides = {_dates(10)[3]: 900.0}
-    for a, b in zip(run_filter(base, rides), run_filter(with_tape, rides)):
-        for key in ("x", "beta", "kappa", "e", "se_x", "se_beta", "se_kappa", "se_e"):
-            assert a[key] == pytest.approx(b[key])
-    assert run_filter(with_tape, rides)[5]["se_btape"] < run_filter(base, rides)[5]["se_btape"]
+    for i in range(0, 60, 7):
+        # Fat falling at p * 0.1 lb/day, on a 14 lb Navy offset.
+        with_tape[i]["tape_bf_pct"] = (50.0 + 14.0 - 0.075 * i) / base[i]["weight"] * 100.0
+    for i in range(0, 60, 1):
+        with_tape[i]["body_fat_pct"] = (50.0 - 0.075 * i) / base[i]["weight"] * 100.0
+    a, b = run_filter(base)[-1], run_filter(with_tape)[-1]
+    assert b["se_beta"] < a["se_beta"]
+
+
+def _simulate_split(n, p, true_beta, fat0, lean0, offset, seed, c_water=0.0, spike_day=None):
+    rng = np.random.default_rng(seed)
+    F, L, e = fat0, lean0, 0.0
+    entries, truth = [], []
+    for i, d in enumerate(_dates(n)):
+        if i:
+            F += p * true_beta + rng.normal(0, 0.02)
+            L += (1 - p) * true_beta + rng.normal(0, 0.1)
+            e = 0.7 * e + rng.normal(0, 0.2)
+        if spike_day is not None and i == spike_day:
+            e += 3.0  # sodium/glycogen spike
+        weight = F + L + e + rng.normal(0, 0.3)
+        entry = {"date": d, "weight": weight,
+                 "body_fat_pct": (F + c_water * e + rng.normal(0, 5.0)) / weight * 100.0}
+        if i % 7 == 0:
+            entry["tape_bf_pct"] = (F + offset + rng.normal(0, 1.0)) / weight * 100.0
+        entries.append(entry)
+        truth.append((F, L))
+    return entries, truth
+
+
+def test_recovers_fat_and_lean_split():
+    entries, truth = _simulate_split(180, 0.75, -0.08, 50.0, 150.0, 14.0, seed=8)
+    final = run_filter(entries)[-1]
+    F, L = truth[-1]
+    assert final["fat"] == pytest.approx(F, abs=3 * final["se_fat"])
+    assert final["lean"] == pytest.approx(L, abs=3 * final["se_lean"])
+    assert final["btape"] == pytest.approx(14.0, abs=3 * final["se_btape"])
+    assert final["se_fat"] < 2.0
+
+
+def test_water_spike_does_not_move_fat_when_loading_modeled():
+    # Index reads a water spike as fat loss (c = -2 lb fat per lb water).
+    # With c modeled correctly, the fat estimate should stay closer to the
+    # truth across the spike than with c = 0.
+    entries, truth = _simulate_split(
+        60, 0.75, -0.05, 50.0, 150.0, 14.0, seed=9, c_water=-2.0, spike_day=40
+    )
+    right = run_filter(entries, params=FilterParams(c_water=-2.0))
+    wrong = run_filter(entries, params=FilterParams(c_water=0.0))
+    err = lambda res: max(abs(res[i]["fat"] - truth[i][0]) for i in range(40, 45))
+    assert err(right) < err(wrong)
+
+
+def _fixed_p_reference(entries, rides, params):
+    """Frozen, independently written fixed-p Option B filter, state
+    [F, L, beta, kappa, e, btape]: F += p*delta, L += (1-p)*delta."""
+    p, n = params.p_fat, 6
+    Q = np.diag([params.q_fat, params.q_lean, params.q_beta, params.q_kappa, params.q_e, params.q_btape])
+    first = entries[0]
+    w0, bf0 = first["weight"], first.get("body_fat_pct")
+    f0 = w0 * (bf0 / 100.0 if bf0 is not None else params.fat_frac0)
+    x = np.array([f0, w0 - f0, 0.0, params.kappa0, 0.0, 0.0])
+    P = np.diag([params.p0_fat, params.p0_x + params.p0_fat, params.p0_beta, params.p0_kappa, params.p0_e, params.p0_btape])
+    P[0, 1] = P[1, 0] = -params.p0_fat
+    out = [x.copy()]
+    day = first["date"]
+    for e in entries[1:]:
+        while day < e["date"]:
+            a = rides.get(day, 0.0) / 3500.0
+            F = np.eye(n)
+            F[0, 2], F[0, 3] = p, -p * a
+            F[1, 2], F[1, 3] = 1 - p, -(1 - p) * a
+            F[4, 4] = params.phi
+            x, P = F @ x, F @ P @ F.T + Q
+            day += timedelta(days=1)
+        H, R, z = [[1, 1, 0, 0, 1, 0]], [params.r], [e["weight"]]
+        if e.get("body_fat_pct") is not None:
+            H.append([1, 0, 0, 0, params.c_water, 0]); R.append(params.r_fat)
+            z.append(e["weight"] * e["body_fat_pct"] / 100.0)
+        if e.get("tape_bf_pct") is not None:
+            H.append([1, 0, 0, 0, 0, 1]); R.append(params.r_tape)
+            z.append(e["weight"] * e["tape_bf_pct"] / 100.0)
+        H, R, z = np.array(H, float), np.diag(R), np.array(z)
+        K = P @ H.T @ np.linalg.inv(H @ P @ H.T + R)
+        x, P = x + K @ (z - H @ x), P - K @ H @ P
+        out.append(x.copy())
+    return out
+
+
+def test_zero_split_deviation_is_exactly_fixed_p_model():
+    # With no room for the fat/lean split to deviate from p, the 8-state
+    # filter must reproduce the fixed-p model, fat readings included.
+    entries, _ = _simulate_split(90, 0.75, -0.08, 50.0, 150.0, 14.0, seed=10)
+    rides = {d: r for d, r in zip(_dates(90), _varying_rides(90, seed=11))}
+    params = FilterParams(p0_dbeta=0.0, q_dbeta=0.0, p0_dkappa=0.0, q_dkappa=0.0)
+    for new, ref in zip(run_filter(entries, rides, params), _fixed_p_reference(entries, rides, params)):
+        assert new["fat"] == pytest.approx(ref[0])
+        assert new["lean"] == pytest.approx(ref[1])
+        assert new["beta"] == pytest.approx(ref[2])
+        assert new["kappa"] == pytest.approx(ref[3])
+        assert new["beta_fat"] == pytest.approx(0.75 * ref[2])
+        assert new["btape"] == pytest.approx(ref[5])
+
+
+def test_learns_fat_lean_split_that_differs_from_prior():
+    # Recomposition: losing fat while gaining lean — a split far from the
+    # 75/25 prior. Weekly tape + daily Index readings should reveal it.
+    n = 240
+    beta_fat, beta_lean = -0.08, 0.03
+    rng = np.random.default_rng(12)
+    F, L, e = 50.0, 150.0, 0.0
+    entries = []
+    for i, d in enumerate(_dates(n)):
+        if i:
+            F += beta_fat + rng.normal(0, 0.02)
+            L += beta_lean + rng.normal(0, 0.1)
+            e = 0.7 * e + rng.normal(0, 0.2)
+        w = F + L + e + rng.normal(0, 0.3)
+        entry = {"date": d, "weight": w, "body_fat_pct": (F + rng.normal(0, 5.0)) / w * 100.0}
+        if i % 7 == 0:
+            entry["tape_bf_pct"] = (F + 14.0 + rng.normal(0, 1.0)) / w * 100.0
+        entries.append(entry)
+
+    final = run_filter(entries)[-1]
+    assert final["beta_fat"] == pytest.approx(beta_fat, abs=3 * final["se_beta_fat"])
+    assert final["beta_lean"] == pytest.approx(beta_lean, abs=3 * final["se_beta_lean"])
+    # And it's actually learned, not just wide error bars: lean drift comes
+    # out positive although total drift is negative (a fixed 75/25 split
+    # would force it to -0.0125), and far tighter than its prior.
+    params = FilterParams()
+    prior_se_lean = np.sqrt(0.25**2 * params.p0_beta + params.p0_dbeta)
+    assert final["beta_lean"] > 0
+    assert final["se_beta_lean"] < 0.5 * prior_se_lean
