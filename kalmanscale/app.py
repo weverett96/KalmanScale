@@ -10,10 +10,12 @@ from pydantic import BaseModel
 from . import db, intervals
 from .filter import (
     FilterParams,
+    filter_states,
     forecast_ride_kcal,
     navy_body_fat_pct,
     projected_trend,
-    run_filter,
+    simulate_forecast,
+    state_result,
 )
 
 app = FastAPI(title="KalmanScale")
@@ -83,9 +85,11 @@ def get_filter():
             }
         )
     rides = {Date.fromisoformat(d): kcal for d, kcal in db.list_rides().items()}
-    results = run_filter(entries, rides, FilterParams())
-    if not results:
-        return {"trajectory": [], "latest": None}
+    params = FilterParams()
+    states = list(filter_states(entries, rides, params))
+    if not states:
+        return {"trajectory": [], "latest": None, "forecast": None}
+    results = [state_result(*s) for s in states]
 
     # Forecast from the rides the latest weigh-in has already seen (through
     # the day before it), over the span the filter has data for.
@@ -99,7 +103,10 @@ def get_filter():
             trend, se_trend = projected_trend(latest, ride_kcal, part)
             latest[f"trend{part}"] = trend
             latest[f"se_trend{part}"] = se_trend
-    return {"trajectory": results, "latest": latest}
+
+    last_date, x, P = states[-1]
+    forecast = simulate_forecast(x, P, last_date, rides, entries[0]["date"], params)
+    return {"trajectory": results, "latest": latest, "forecast": forecast}
 
 
 @app.post("/api/intervals/sync")

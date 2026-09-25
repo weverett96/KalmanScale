@@ -17,6 +17,11 @@ much gets eaten back. A Kalman filter combines:
 
 No intake logging required.
 
+The chart extends 30 days ahead with a Monte Carlo forecast: 2,000 draws from the
+filter's current posterior, stepped forward with its own dynamics, with future rides
+resampled from your past 7-day training weeks (recent weeks favored). It shows the
+median true weight and a 50% interval.
+
 ## Setup
 
 1. In intervals.icu, connect Garmin and enable **Weight** and **Body Fat** under

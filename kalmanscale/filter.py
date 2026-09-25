@@ -144,7 +144,7 @@ _READOUTS = {
 }
 
 
-def _state_result(day, x: np.ndarray, P: np.ndarray) -> dict:
+def state_result(day, x: np.ndarray, P: np.ndarray) -> dict:
     out = {"date": day.isoformat() if isinstance(day, Date) else day}
     for name, v in _READOUTS.items():
         out[name] = float(v @ x)
@@ -167,6 +167,25 @@ def navy_body_fat_pct(abdomen_in: float, neck_in: float, height_in: float) -> fl
     )
 
 
+def _ride_blocks(
+    ride_kcal_by_date: dict[Date, float], start: Date, end: Date, decay: float
+) -> list[tuple[Date, list[float], float]]:
+    """Consecutive, non-overlapping 7-day blocks of [start, end], newest
+    first, ending at `end` (matching a 7-day training calendar). Each is
+    (block_start, daily kcal, EWMA weight): the newest block gets weight 1,
+    the one before `decay`, then decay^2, and so on. The oldest block may
+    be partial and holds only the days it has."""
+    blocks = []
+    block_end, k = end, 0
+    while block_end >= start:
+        block_start = max(start, block_end - timedelta(days=6))
+        n_days = (block_end - block_start).days + 1
+        kcal = [ride_kcal_by_date.get(block_start + timedelta(days=i), 0.0) for i in range(n_days)]
+        blocks.append((block_start, kcal, decay**k))
+        block_end, k = block_start - timedelta(days=1), k + 1
+    return blocks
+
+
 def forecast_ride_kcal(
     ride_kcal_by_date: dict[Date, float],
     start: Date,
@@ -174,30 +193,123 @@ def forecast_ride_kcal(
     decay: float = 0.7,
 ) -> float | None:
     """
-    Forward-looking daily ride kcal, for projecting the trend. Splits
-    [start, end] into consecutive 7-day blocks ending at `end` (matching a
-    7-day training calendar), takes each block's mean daily kcal, and
-    combines them with an EWMA: the most recent block gets weight 1, the
-    one before `decay`, then decay^2, and so on (decay 0.7 ≈ 2-week
-    half-life). A partial oldest block uses the days it has, and weights
-    are normalized over the blocks that exist, so a short history isn't
-    dragged toward zero. Returns None if start > end.
+    Forward-looking daily ride kcal, for projecting the trend: an EWMA of
+    each 7-day block's mean daily kcal (see _ride_blocks; decay 0.7 ≈
+    2-week half-life). A partial oldest block uses the days it has, and
+    weights are normalized over the blocks that exist, so a short history
+    isn't dragged toward zero. Returns None if start > end.
     """
-    if start > end:
+    blocks = _ride_blocks(ride_kcal_by_date, start, end, decay)
+    if not blocks:
         return None
-    num = den = 0.0
-    block_end, k = end, 0
-    while block_end >= start:
-        block_start = max(start, block_end - timedelta(days=6))
-        n_days = (block_end - block_start).days + 1
-        total = sum(
-            ride_kcal_by_date.get(block_start + timedelta(days=i), 0.0) for i in range(n_days)
-        )
-        w = decay**k
-        num += w * total / n_days
-        den += w
-        block_end, k = block_start - timedelta(days=1), k + 1
-    return num / den
+    den = sum(w for _, _, w in blocks)
+    return sum(w * np.mean(kcal) for _, kcal, w in blocks) / den
+
+
+def sample_future_rides(
+    ride_kcal_by_date: dict[Date, float],
+    start: Date,
+    end: Date,
+    first_day: Date,
+    horizon: int,
+    n: int,
+    rng: np.random.Generator,
+    decay: float = 0.7,
+) -> np.ndarray:
+    """
+    (n, horizon) ride kcal for days first_day .. first_day + horizon - 1.
+    Each simulated 7-day week (starting at first_day) of each sample
+    replays one past block from [start, end], picked with the EWMA weights,
+    aligned by weekday so e.g. a long Saturday ride stays on Saturday. A
+    partial block's missing weekdays are filled with its mean, so the
+    expected daily kcal equals forecast_ride_kcal exactly.
+    """
+    blocks = _ride_blocks(ride_kcal_by_date, start, end, decay)
+    if not blocks:
+        return np.zeros((n, horizon))
+    weights = np.array([w for _, _, w in blocks])
+    weights /= weights.sum()
+
+    # by_weekday[b, d] = block b's kcal on weekday d (date.weekday()).
+    by_weekday = np.empty((len(blocks), 7))
+    for b, (block_start, kcal, _) in enumerate(blocks):
+        by_weekday[b, :] = np.mean(kcal)
+        for i, k in enumerate(kcal):
+            by_weekday[b, (block_start + timedelta(days=i)).weekday()] = k
+
+    n_weeks = -(-horizon // 7)
+    picks = rng.choice(len(blocks), size=(n, n_weeks), p=weights)
+    days = np.arange(horizon)
+    weekdays = np.array([(first_day + timedelta(days=int(d))).weekday() for d in days])
+    return by_weekday[picks[:, days // 7], weekdays]
+
+
+def _sqrt_psd(M: np.ndarray) -> np.ndarray:
+    """A matrix S with S @ S.T == M, for a symmetric PSD M (tolerates
+    tiny negative eigenvalues from rounding, and exact zeros)."""
+    w, V = np.linalg.eigh((M + M.T) / 2)
+    return V * np.sqrt(np.clip(w, 0.0, None))
+
+
+def simulate_forecast(
+    x: np.ndarray,
+    P: np.ndarray,
+    latest: Date,
+    ride_kcal_by_date: dict[Date, float],
+    history_start: Date,
+    params: FilterParams | None = None,
+    horizon: int = 30,
+    n: int = 2000,
+    quantiles: tuple[float, ...] = (0.25, 0.5, 0.75),
+    seed: int | None = None,
+) -> dict:
+    """
+    Monte Carlo forecast of true weight (F + L) for the `horizon` days
+    after `latest`, starting from the filter's posterior (x, P) there.
+
+    Each of `n` samples draws a starting state from N(x, P), then steps
+    forward day by day with the filter's own dynamics and process noise.
+    The step into day d uses day d-1's rides: the latest day's recorded
+    rides if it has any (else it's simulated too — the weigh-in usually
+    precedes the ride), then resampled past weeks (sample_future_rides,
+    using blocks from history_start through the day before latest).
+
+    Returns {"dates": [...], "q25": [...], "q50": [...], ...} (one key per
+    quantile). seed defaults to latest's ordinal, so the band is stable
+    across reloads and only changes when new data arrives.
+    """
+    if params is None:
+        params = FilterParams()
+    rng = np.random.default_rng(latest.toordinal() if seed is None else seed)
+
+    X = x + rng.standard_normal((n, N_STATES)) @ _sqrt_psd(P).T
+    Q_sqrt = _sqrt_psd(_Q(params))
+
+    # Ride inputs for days latest .. latest + horizon - 1 (step d uses d-1).
+    known_today = ride_kcal_by_date.get(latest)
+    first_sim_day = latest + timedelta(days=1) if known_today is not None else latest
+    sim_len = horizon - 1 if known_today is not None else horizon
+    sampled = sample_future_rides(
+        ride_kcal_by_date, history_start, latest - timedelta(days=1),
+        first_sim_day, sim_len, n, rng,
+    )
+    rides = sampled if known_today is None else np.hstack([np.full((n, 1), known_today), sampled])
+
+    out = {f"q{int(round(q * 100))}": [] for q in quantiles}
+    dates = []
+    for d in range(horizon):
+        a = rides[:, d] / KCAL_PER_LB
+        X_next = X.copy()
+        X_next[:, 0] = X[:, 0] + X[:, 2] - X[:, 4] * a
+        X_next[:, 1] = X[:, 1] + X[:, 3] - X[:, 5] * a
+        X_next[:, 6] = params.phi * X[:, 6]
+        X = X_next + rng.standard_normal((n, N_STATES)) @ Q_sqrt.T
+
+        total = X[:, 0] + X[:, 1]
+        for q, v in zip(quantiles, np.quantile(total, quantiles)):
+            out[f"q{int(round(q * 100))}"].append(float(v))
+        dates.append((latest + timedelta(days=d + 1)).isoformat())
+    return {"dates": dates, **out}
 
 
 def projected_trend(
@@ -250,12 +362,22 @@ def run_filter(
     predict-only steps internally for any gap days (not included in the
     output, since there's no entry for them).
     """
+    return [state_result(day, x, P) for day, x, P in filter_states(entries, ride_kcal_by_date, params)]
+
+
+def filter_states(
+    entries: list[dict],
+    ride_kcal_by_date: dict[Date, float] | None = None,
+    params: FilterParams | None = None,
+):
+    """Yields (date, x, P) — the raw posterior mean and covariance — after
+    each entry. See run_filter for the input contract."""
     if params is None:
         params = FilterParams()
     if ride_kcal_by_date is None:
         ride_kcal_by_date = {}
     if not entries:
-        return []
+        return
 
     Q = _Q(params)
 
@@ -281,7 +403,7 @@ def run_filter(
     P[4:6, 4:6] = _split_cov(p, params.p0_kappa, params.p0_dkappa)
     P[6, 6], P[7, 7] = params.p0_e, params.p0_btape
 
-    results = [_state_result(first["date"], x, P)]
+    yield first["date"], x, P
     prev_date = first["date"]
 
     for e in entries[1:]:
@@ -302,10 +424,8 @@ def run_filter(
 
         x, P = _apply_measurement(x, P, e, params)
 
-        results.append(_state_result(e["date"], x, P))
+        yield e["date"], x, P
         prev_date = e["date"]
-
-    return results
 
 
 def _apply_measurement(x, P, e: dict, params: FilterParams):

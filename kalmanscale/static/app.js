@@ -83,35 +83,67 @@ function renderStats(latest) {
   `;
 }
 
-function renderChart(entries, trajectory) {
-  const labels = trajectory.map(r => r.date);
-  const raw = entries.map(e => e.weight);
-  const filtered = trajectory.map(r => r.x);
+const DAY_MS = 86400000;
+const dayNum = (iso) => Date.parse(iso + "T00:00:00Z") / DAY_MS;
+const isoFromDayNum = (n) => new Date(n * DAY_MS).toISOString().slice(0, 10);
+
+function renderChart(entries, trajectory, forecast) {
+  // Linear x axis in days, so gaps between weigh-ins and the 30-day
+  // forecast are spaced by real calendar time.
+  const pts = (dates, ys) => dates.map((d, i) => ({ x: dayNum(d), y: ys[i] }));
+  const raw = pts(entries.map(e => e.date), entries.map(e => e.weight));
+  const filtered = pts(trajectory.map(r => r.date), trajectory.map(r => r.x));
 
   const styles = getComputedStyle(document.documentElement);
   const rawColor = styles.getPropertyValue("--raw-point").trim();
   const accentColor = styles.getPropertyValue("--accent").trim();
+  const bandColor = styles.getPropertyValue("--band").trim();
   const textColor = styles.getPropertyValue("--text").trim();
   const borderColor = styles.getPropertyValue("--border").trim();
+
+  const datasets = [
+    { label: "Raw weight", data: raw, borderColor: rawColor, backgroundColor: rawColor, pointRadius: 3, showLine: false },
+    { label: "Filtered trend", data: filtered, borderColor: accentColor, backgroundColor: accentColor, pointRadius: 0, borderWidth: 2, tension: 0.15 },
+  ];
+  if (forecast && filtered.length) {
+    // Anchor the fan at the last filtered point so it grows out of the line.
+    const start = filtered[filtered.length - 1];
+    const fc = (key) => [start, ...pts(forecast.dates, forecast[key])];
+    datasets.push(
+      { label: "_q25", data: fc("q25"), borderColor: "transparent", pointRadius: 0, fill: false },
+      { label: "50% interval", data: fc("q75"), borderColor: "transparent", backgroundColor: bandColor, pointRadius: 0, fill: "-1" },
+      { label: "Forecast (median)", data: fc("q50"), borderColor: accentColor, backgroundColor: accentColor, borderDash: [6, 4], pointRadius: 0, borderWidth: 2 },
+    );
+  }
 
   if (chart) chart.destroy();
   chart = new Chart(document.getElementById("chart"), {
     type: "line",
-    data: {
-      labels,
-      datasets: [
-        { label: "Raw weight", data: raw, borderColor: rawColor, backgroundColor: rawColor, pointRadius: 3, showLine: false },
-        { label: "Filtered trend", data: filtered, borderColor: accentColor, backgroundColor: accentColor, pointRadius: 0, borderWidth: 2, tension: 0.15 },
-      ],
-    },
+    data: { datasets },
     options: {
       maintainAspectRatio: false,
       color: textColor,
+      interaction: { mode: "nearest", axis: "x", intersect: false },
       scales: {
-        x: { ticks: { color: textColor, maxRotation: 0 }, grid: { color: borderColor } },
+        x: {
+          type: "linear",
+          min: raw.length ? raw[0].x : undefined,
+          max: forecast ? dayNum(forecast.dates[forecast.dates.length - 1]) : undefined,
+          ticks: { color: textColor, maxRotation: 0, stepSize: 7, callback: (v) => isoFromDayNum(v).slice(5) },
+          grid: { color: borderColor },
+        },
         y: { title: { display: true, text: "lb", color: textColor }, ticks: { color: textColor }, grid: { color: borderColor } },
       },
-      plugins: { legend: { labels: { color: textColor } } },
+      plugins: {
+        legend: { labels: { color: textColor, filter: (item) => !item.text.startsWith("_") } },
+        tooltip: {
+          filter: (item) => !item.dataset.label.startsWith("_"),
+          callbacks: {
+            title: (items) => items.length ? isoFromDayNum(items[0].parsed.x) : "",
+            label: (item) => `${item.dataset.label}: ${item.parsed.y.toFixed(1)} lb`,
+          },
+        },
+      },
     },
   });
 }
@@ -144,7 +176,7 @@ async function refresh() {
 
   const filterResult = await api("/api/filter");
   renderStats(filterResult.latest);
-  renderChart(entries, filterResult.trajectory);
+  renderChart(entries, filterResult.trajectory, filterResult.forecast);
   renderTable(entries);
 }
 
