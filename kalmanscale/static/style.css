@@ -150,6 +150,7 @@ button.icon {
   gap: 0.6rem;
   flex-wrap: wrap;
 }
+.sync-row button.primary { width: auto; margin-top: 0; padding: 0.6rem 1.1rem; }
 .sync-note { font-size: 0.78rem; color: var(--muted); }
 #sync-status { font-size: 0.82rem; color: var(--muted); margin-top: 0.4rem; min-height: 1.2em; }
 

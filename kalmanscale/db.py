@@ -7,8 +7,11 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
     date TEXT PRIMARY KEY,      -- ISO 8601
     weight REAL NOT NULL,       -- lb
-    cal_in REAL,                -- nullable
-    cal_out REAL                -- nullable, Whoop
+    body_fat_pct REAL           -- nullable, Garmin Index
+);
+CREATE TABLE IF NOT EXISTS rides (
+    date TEXT PRIMARY KEY,      -- ISO 8601, local start date
+    kcal REAL NOT NULL          -- summed over that day's rides
 );
 """
 
@@ -17,66 +20,52 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
     if "body_fat_pct" not in columns:
         conn.execute("ALTER TABLE entries ADD COLUMN body_fat_pct REAL")
+    # Intake/Whoop expenditure were dropped in favor of intervals.icu ride kcal.
+    for dropped in ("cal_in", "cal_out"):
+        if dropped in columns:
+            conn.execute(f"ALTER TABLE entries DROP COLUMN {dropped}")
 
 
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(_SCHEMA)
+    conn.executescript(_SCHEMA)
     _migrate(conn)
     return conn
 
 
-def upsert_entry(
-    date_str: str,
-    weight: float,
-    cal_in: float | None,
-    cal_out: float | None,
-    body_fat_pct: float | None = None,
-) -> None:
+def upsert_entry(date_str: str, weight: float, body_fat_pct: float | None = None) -> None:
     with _conn() as conn:
         conn.execute(
             """
-            INSERT INTO entries (date, weight, cal_in, cal_out, body_fat_pct)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO entries (date, weight, body_fat_pct)
+            VALUES (?, ?, ?)
             ON CONFLICT(date) DO UPDATE SET
                 weight = excluded.weight,
-                cal_in = excluded.cal_in,
-                cal_out = excluded.cal_out,
                 body_fat_pct = excluded.body_fat_pct
             """,
-            (date_str, weight, cal_in, cal_out, body_fat_pct),
+            (date_str, weight, body_fat_pct),
         )
-
-
-def backfill_cal_out(date_str: str, cal_out: float) -> bool:
-    """Fill cal_out only for an existing row where it's currently NULL.
-    Never overwrites an already-set value, never creates a new row.
-    Returns True if a row was actually updated."""
-    with _conn() as conn:
-        cur = conn.execute(
-            "UPDATE entries SET cal_out = ? WHERE date = ? AND cal_out IS NULL",
-            (cal_out, date_str),
-        )
-        return cur.rowcount > 0
-
-
-def delete_entry(date_str: str) -> None:
-    with _conn() as conn:
-        conn.execute("DELETE FROM entries WHERE date = ?", (date_str,))
 
 
 def list_entries() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT date, weight, cal_in, cal_out, body_fat_pct FROM entries ORDER BY date ASC"
+            "SELECT date, weight, body_fat_pct FROM entries ORDER BY date ASC"
         ).fetchall()
-    return [
-        {
-            "date": r[0],
-            "weight": r[1],
-            "cal_in": r[2],
-            "cal_out": r[3],
-            "body_fat_pct": r[4],
-        }
-        for r in rows
-    ]
+    return [{"date": r[0], "weight": r[1], "body_fat_pct": r[2]} for r in rows]
+
+
+def replace_rides(oldest: str, newest: str, kcal_by_date: dict[str, float]) -> None:
+    """Replace all ride rows in [oldest, newest] with kcal_by_date, so rides
+    deleted or edited upstream are corrected on the next sync."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM rides WHERE date BETWEEN ? AND ?", (oldest, newest))
+        conn.executemany(
+            "INSERT INTO rides (date, kcal) VALUES (?, ?)", sorted(kcal_by_date.items())
+        )
+
+
+def list_rides() -> dict[str, float]:
+    with _conn() as conn:
+        rows = conn.execute("SELECT date, kcal FROM rides ORDER BY date ASC").fetchall()
+    return {r[0]: r[1] for r in rows}

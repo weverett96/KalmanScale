@@ -24,6 +24,18 @@ CREATE TABLE entries (
 
 No separate "filter runs" table — the filter is cheap enough (O(n), n = days logged) to rerun on every request rather than cache incrementally. Revisit only if n grows into the thousands.
 
+## 2026-09-25 update: intervals.icu, ride kcal, learned κ (supersedes intake/Whoop below)
+
+Intake logging was dropped: it's tedious enough that it wouldn't be done consistently. Whoop was dropped too: its cycling kcal ran 2–4x the power-meter-derived number from Garmin. All data now comes from **intervals.icu** via its official personal API key (Basic auth, `API_KEY:<key>`, athlete id `0`). That covers Garmin Index weight and body fat from the wellness endpoint, and cycling ride kJ from the activities endpoint. With a power meter, kJ ≈ kcal, because the 4.184 kJ/kcal factor roughly cancels ~24% gross efficiency.
+
+Without intake, $b$ is unidentifiable (a constant intake bias is indistinguishable from $\beta$), so it was replaced by **$\kappa_t$**: the fraction of ride kcal *not* eaten back, modeled as a slow random walk. State is now $[x, \beta, \kappa, e, fat]$, and
+
+$$x_t = x_{t-1} + \beta_{t-1} - \kappa_{t-1} A_{t-1}/3500$$
+
+Here $A_{t-1}$ is the *previous* calendar day's ride kcal, because a morning weigh-in reflects yesterday's ride. $A$ is a known input, so the model is still linear (F varies per day). A no-ride day is $A = 0$, not missing data, and rides on gap days still count. $\beta$ now means baseline drift on a no-ride day. $\kappa$ is only identifiable when ride volume varies: with constant rides, $\kappa A$ collapses into $\beta$, as covered in `tests/test_filter.py`. On synthetic data it learns slowly, with SE ≈ 0.21 after 90 days and ≈ 0.16 after 240, Backfill isn't available: intervals.icu only has data from when Garmin was connected (2026-09-20). We're starting fresh from there (decided 2026-09-25) rather than importing Garmin Connect CSV history, so κ will stay close to its prior for the first few months.
+
+The sections below describe the original intake/Whoop design and are kept for history.
+
 ## 3. Filter core (`filter.py`)
 
 State vector: $s_t = [x_t, \beta_t, b_t, e_t]^\top$
@@ -57,6 +69,8 @@ Still linear in the state (4x4 $F$ now, with $\phi$ in the $(4,4)$ entry), so a 
 - Edge cases: missing `cal_in`/`cal_out` on some days (net should fall back to 0 control input, not crash), gaps of >1 day between entries (multi-step predict, remembering $e_t$ decays each skipped day too), a single data point (should not update, just initialize).
 
 ## 4. Data ingestion
+
+*Superseded 2026-09-25: see the update at the top of Section 3. Whoop, manual intake, and the Garmin-manual plan below were replaced by intervals.icu sync.*
 
 **Whoop — automated.** Whoop has a self-serve developer platform (free, requires a Whoop membership). Register an app in the Developer Dashboard, run the OAuth flow once against your own account to get an access + refresh token (request the `offline` scope so the refresh token doesn't expire), then:
 - A daily cron job on the Pi refreshes the access token and pulls the latest cycle/recovery/workout data, computing `cal_out` and upserting it into `entries`.
@@ -102,8 +116,8 @@ This is close to a working reference implementation of the above already sitting
 
 ## 8. Open decisions to make while building
 
-- ~~MyFitnessPal/Cronometer integration for `cal_in`~~ — resolved: manual entry only, explicit non-goal for v1 (Section 4).
-- ~~Historical backfill on first launch~~ — resolved: start fresh, no backfill for v1; deferred to v2 (Section 7).
+- ~~MyFitnessPal/Cronometer integration for `cal_in`~~ — resolved: manual entry only, explicit non-goal for v1 (Section 4). **Superseded 2026-09-25:** intake dropped entirely; see Section 3 update.
+- ~~Historical backfill on first launch~~ — resolved: start fresh, no backfill for v1; deferred to v2 (Section 7). **Revisited 2026-09-25:** still starting fresh. intervals.icu has no data from before the Garmin connection, and a Garmin Connect CSV import was considered but skipped.
 - Units: lb-only vs. toggle. Simplify to one unit for v1.
 - What happens on a day with a weight entry but no calorie data — treat as a pure random-walk step on $x,\beta$ with $b$ carried forward? (Recommended: yes, exactly that — control input just drops to 0.)
 - Whether `GET /filter` returns the full trajectory (needed for the chart) or just the latest state (needed for the stat panel) — probably both, single response.

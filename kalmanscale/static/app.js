@@ -7,89 +7,56 @@ async function api(path, opts) {
   return res.json();
 }
 
-let entriesByDate = {};
+let ridesByDate = {};
 let chart = null;
 
-const dateInput = document.getElementById("date");
-const weightInput = document.getElementById("weight");
-const calInInput = document.getElementById("cal_in");
-const calOutInput = document.getElementById("cal_out");
-const bodyFatInput = document.getElementById("body_fat_pct");
 const syncStatus = document.getElementById("sync-status");
 const statsEl = document.getElementById("stats");
-
-function loadFormForDate(dateStr) {
-  const entry = entriesByDate[dateStr];
-  weightInput.value = entry ? entry.weight : "";
-  calInInput.value = entry && entry.cal_in !== null ? entry.cal_in : "";
-  calOutInput.value = entry && entry.cal_out !== null ? entry.cal_out : "";
-  bodyFatInput.value = entry && entry.body_fat_pct !== null ? entry.body_fat_pct : "";
-}
-
-dateInput.valueAsDate = new Date();
-dateInput.addEventListener("change", (ev) => loadFormForDate(ev.target.value));
 
 document.getElementById("sync-btn").addEventListener("click", async () => {
   syncStatus.textContent = "Syncing...";
   try {
-    const result = await api("/api/whoop/sync", { method: "POST" });
-    if (result.updated.length === 0) {
-      syncStatus.textContent = "Nothing to backfill — no entries missing cal_out for a completed day.";
-    } else {
-      const list = result.updated.map(u => `${u.date} (${u.cal_out.toFixed(0)} kcal)`).join(", ");
-      syncStatus.textContent = `Backfilled: ${list}`;
-    }
+    const result = await api("/api/intervals/sync", { method: "POST" });
+    syncStatus.textContent = `Synced ${result.oldest} to ${result.newest}: ${result.weigh_ins} weigh-ins, ${result.ride_days} ride days.`;
     await refresh();
   } catch (e) {
     syncStatus.textContent = "Sync failed: " + e.message;
   }
 });
-
-document.getElementById("entry-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const body = {
-    date: dateInput.value,
-    weight: parseFloat(weightInput.value),
-    cal_in: calInInput.value ? parseFloat(calInInput.value) : null,
-    cal_out: calOutInput.value ? parseFloat(calOutInput.value) : null,
-    body_fat_pct: bodyFatInput.value ? parseFloat(bodyFatInput.value) : null,
-  };
-  await api("/api/entries", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  syncStatus.textContent = "";
-  await refresh();
-});
-
-async function deleteEntry(date) {
-  await api(`/api/entries/${date}`, { method: "DELETE" });
-  await refresh();
-}
-
 function stat(label, value, sub) {
   return `<div class="stat"><div class="label">${label}</div><div class="value">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ""}</div>`;
 }
 
+function lbWk(perDay) {
+  const v = perDay * 7;
+  return `${v > 0 ? "+" : ""}${v.toFixed(2)} lb/wk`;
+}
+
+function zNote(value, se) {
+  return Math.abs(value / se) > 1.96 ? "distinguishable from zero" : "not yet distinguishable from zero";
+}
+
 function renderStats(latest) {
   if (!latest) {
-    statsEl.innerHTML = '<div class="stat-grid"><div class="stat empty">No entries yet — log today\'s weight to get started.</div></div>';
+    statsEl.innerHTML = '<div class="stat-grid"><div class="stat empty">No weigh-ins yet — sync from intervals.icu to get started.</div></div>';
     return;
   }
-  const betaWk = (latest.beta * 7).toFixed(2);
-  const betaSeWk = (latest.se_beta * 7).toFixed(2);
-  const distinguishable = Math.abs(latest.beta_z) > 1.96;
+
+  const trendStat = latest.trend === undefined
+    ? stat("Trend", "&mdash;", "needs a second weigh-in")
+    : stat("Trend", lbWk(latest.trend),
+        `&plusmn;${(latest.se_trend * 7).toFixed(2)}/wk &middot; at ~${latest.ride_kcal_forecast.toFixed(0)} ride kcal/day (weekly EWMA) &middot; ${zNote(latest.trend, latest.se_trend)}`);
 
   statsEl.innerHTML = `
     <div class="stat-grid">
       ${stat("Filtered weight", `${latest.x.toFixed(1)} lb`, `&plusmn;${latest.se_x.toFixed(2)}`)}
-      ${stat("Trend (&beta;)", `${betaWk} lb/wk`, `&plusmn;${betaSeWk}/wk &middot; ${distinguishable ? "distinguishable from zero" : "not yet distinguishable from zero"}`)}
-      ${stat("Bias (b)", `${latest.b.toFixed(0)} kcal/day`, `&plusmn;${latest.se_b.toFixed(0)}`)}
+      ${trendStat}
+      ${stat("Baseline (&beta;)", lbWk(latest.beta), `&plusmn;${(latest.se_beta * 7).toFixed(2)}/wk &middot; with no riding &middot; ${zNote(latest.beta, latest.se_beta)}`)}
+      ${stat("Ride kcal kept off (&kappa;)", `${(latest.kappa * 100).toFixed(0)}%`, `&plusmn;${(latest.se_kappa * 100).toFixed(0)}% &middot; share of ride kcal not eaten back`)}
       ${stat("Water-weight (e)", `${latest.e.toFixed(2)} lb`, "AR(1) transient")}
       ${stat("Fat mass", `${latest.fat.toFixed(1)} lb`, `&plusmn;${latest.se_fat.toFixed(1)} &middot; from Garmin Index bioimpedance`)}
     </div>
-    <div class="caveat">&beta; may reflect residual/unexplained trend rather than the whole trend, since tracked calorie balance already explains most calorie-driven change — see plan Section 6. Fat mass is currently an independent estimate, not yet coupled into the weight/trend dynamics.</div>
+    <div class="caveat">Trend = &beta; &minus; &kappa; &times; forecast ride kcal / 3500, where the forecast is an EWMA of your recent 7-day blocks of riding (most recent week weighted 1, then 0.7, 0.49, &hellip;). &kappa; only becomes identifiable once ride volume varies over time. Fat mass is currently an independent estimate, not yet coupled into the weight/trend dynamics.</div>
   `;
 }
 
@@ -126,24 +93,27 @@ function renderChart(entries, trajectory) {
   });
 }
 
+function prevDayRideKcal(dateStr) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() - 1);
+  return ridesByDate[d.toISOString().slice(0, 10)];
+}
+
 function renderTable(entries) {
   const tbody = document.querySelector("#entries-table tbody");
   tbody.innerHTML = "";
   for (const e of [...entries].reverse()) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${e.date}</td><td>${e.weight}</td><td>${e.cal_in ?? ""}</td><td>${e.cal_out ?? ""}</td><td>${e.body_fat_pct ?? ""}</td>
-      <td><button class="icon" title="Delete" data-date="${e.date}">&times;</button></td>
+      <td>${e.date}</td><td>${e.weight}</td><td>${e.body_fat_pct ?? ""}</td><td>${prevDayRideKcal(e.date) ?? ""}</td>
     `;
-    tr.querySelector("button").addEventListener("click", () => deleteEntry(e.date));
     tbody.appendChild(tr);
   }
 }
 
 async function refresh() {
   const entries = await api("/api/entries");
-  entriesByDate = Object.fromEntries(entries.map(e => [e.date, e]));
-  loadFormForDate(dateInput.value);
+  ridesByDate = await api("/api/rides");
 
   const filterResult = await api("/api/filter");
   renderStats(filterResult.latest);
