@@ -19,6 +19,11 @@ from kalmanscale.filter import (
 np.random.seed(0)
 
 
+# Switches off metabolic adaptation and glycogen water, for reduction tests
+# against the linear-drift models that predate them.
+NO_CURVES = dict(lam=0.0, eta=0.0, q_g=0.0, p0_g=0.0)
+
+
 def _dates(n, start=date(2026, 1, 1)):
     return [start + timedelta(days=i) for i in range(n)]
 
@@ -198,7 +203,7 @@ def test_matches_reference_implementation():
     """Reduction test: with no fat readings, the Option B fat/lean split must
     reproduce a frozen, independently written unsplit [x, beta, kappa, e]
     filter exactly (x = F + L, q_x = q_fat + q_lean) — weight alone can't
-    see the split."""
+    see the split — once the curvature terms are off."""
 
     def reference(entries, rides, params):
         H = np.array([1.0, 0.0, 0.0, 1.0])
@@ -235,7 +240,7 @@ def test_matches_reference_implementation():
     rng = np.random.default_rng(3)
     entries = [{"date": d, "weight": 200.0 + rng.normal(0, 0.5)} for d in dates]
 
-    params = FilterParams()
+    params = FilterParams(**NO_CURVES)
     new_results = run_filter(entries, rides, params)
     ref_results = reference(entries, rides, params)
 
@@ -409,7 +414,7 @@ def test_zero_split_deviation_is_exactly_fixed_p_model():
     # filter must reproduce the fixed-p model, fat readings included.
     entries, _ = _simulate_split(90, 0.75, -0.08, 50.0, 150.0, 14.0, seed=10)
     rides = {d: r for d, r in zip(_dates(90), _varying_rides(90, seed=11))}
-    params = FilterParams(p0_dbeta=0.0, q_dbeta=0.0, p0_dkappa=0.0, q_dkappa=0.0)
+    params = FilterParams(p0_dbeta=0.0, q_dbeta=0.0, p0_dkappa=0.0, q_dkappa=0.0, **NO_CURVES)
     for new, ref in zip(run_filter(entries, rides, params), _fixed_p_reference(entries, rides, params)):
         assert new["fat"] == pytest.approx(ref[0])
         assert new["lean"] == pytest.approx(ref[1])
@@ -448,3 +453,44 @@ def test_learns_fat_lean_split_that_differs_from_prior():
     prior_se_lean = np.sqrt(0.25**2 * params.p0_beta + params.p0_dbeta)
     assert final["beta_lean"] > 0
     assert final["se_beta_lean"] < 0.5 * prior_se_lean
+
+
+def test_metabolic_adaptation_slows_loss_geometrically():
+    # With no rides or noise, each day's tissue change is the last one times
+    # (1 - lam): loss decays toward equilibrium instead of running linearly.
+    from kalmanscale.filter import _F, _TOTAL
+
+    params = FilterParams()
+    x = np.zeros(9)
+    x[:4] = [50.0, 150.0, -0.15, -0.05]
+    F = _F(params, 0.0)
+    steps = []
+    for _ in range(60):
+        x_next = F @ x
+        steps.append(_TOTAL @ (x_next - x))
+        x = x_next
+    assert steps[0] == pytest.approx(-0.2)
+    assert np.allclose(steps, -0.2 * (1 - params.lam) ** np.arange(60))
+
+
+def test_diet_start_water_drop_not_read_as_trend():
+    # A deficit starting a few days into the data: glycogen water falls to
+    # eta * beta over ~2 weeks on top of the tissue loss. The linear-drift
+    # model folds that drop into beta and stays too steep.
+    params = FilterParams()
+    rng = np.random.default_rng(13)
+    n, start, beta = 25, 5, -0.1
+    W, g, e, entries = 200.0, 0.0, 0.0, []
+    for i, d in enumerate(_dates(n)):
+        if i:
+            b = beta if i > start else 0.0
+            W += b + rng.normal(0, 0.05)
+            g = params.phi_g * g + (1 - params.phi_g) * params.eta * b
+            e = 0.7 * e + rng.normal(0, 0.2)
+        entries.append({"date": d, "weight": W + g + e + rng.normal(0, 0.3)})
+
+    with_g = run_filter(entries)[-1]
+    linear = run_filter(entries, params=FilterParams(**NO_CURVES))[-1]
+    assert with_g["beta"] == pytest.approx(beta, abs=2 * with_g["se_beta"])
+    assert linear["beta"] < beta - 0.02
+    assert abs(linear["beta"] - beta) > 3 * abs(with_g["beta"] - beta)

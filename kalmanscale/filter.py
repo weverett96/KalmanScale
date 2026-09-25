@@ -1,8 +1,8 @@
 """
-8-state Kalman filter for weight trend estimation, with weight split into
+9-state Kalman filter for weight trend estimation, with weight split into
 fat and lean mass, each with its own drift and ride response.
 
-State vector s_t = [F, L, beta_F, beta_L, kappa_F, kappa_L, e, btape]:
+State vector s_t = [F, L, beta_F, beta_L, kappa_F, kappa_L, e, btape, g]:
   F, L        fat and lean mass (lb). Fat is on the Garmin Index
               bioimpedance scale; lean is everything else, excluding the
               transient water in e. True weight is F + L.
@@ -14,12 +14,35 @@ State vector s_t = [F, L, beta_F, beta_L, kappa_F, kappa_L, e, btape]:
   btape       constant offset (lb of fat mass) between tape-measure (US Navy
               formula) body fat and the Index — the Index is the reference,
               so this absorbs the method gap; slow random walk
+  g           glycogen-bound water (lb): tracks recent energy balance, so
+              starting a deficit gives a one-time drop that then holds
 
 Transition, with a = A_{t-1} / 3500 and A_{t-1} = the previous calendar
 day's ride kcal (a morning weigh-in reflects yesterday's ride):
 
-  F_t = F_{t-1} + beta_F - kappa_F * a
-  L_t = L_{t-1} + beta_L - kappa_L * a
+  D = (beta_F + beta_L) - (kappa_F + kappa_L) * a     (tissue change, lb)
+
+  F_t      = F_{t-1} + beta_F - kappa_F * a
+  L_t      = L_{t-1} + beta_L - kappa_L * a
+  beta_F_t = beta_F - p * lam * D
+  beta_L_t = beta_L - (1 - p) * lam * D
+  g_t      = phi_g * g + (1 - phi_g) * eta * (beta_F + beta_L)
+
+Metabolic adaptation: maintenance burn falls ~10 kcal/day per lb lost
+(Hall), so each lb of tissue change moves the no-ride drift by
+lam = 10 / 3500 lb/day in the other direction. Integrated, beta_t =
+beta_0 - lam * (W_t - W_0) (plus its random walk): weight decays
+exponentially toward the equilibrium where beta = 0 instead of falling
+in a straight line. Only the deterministic part of D feeds it — process
+noise in F and L doesn't, which is negligible at lam ~ 0.003.
+
+Glycogen water: g is an EWMA (phi_g) of eta * beta, i.e. water held with
+glycogen settles at eta lb per lb/day of baseline drift. A new deficit
+first drops weight faster (g falling to its new level over ~1-2 weeks),
+then g holds steady and only F + L keep moving. Without g the filter
+reads that one-time drop as trend. Driven by beta, not rides: a ride's
+glycogen is mostly refilled within a day or two, and a per-ride water
+dip would compete with kappa for the same next-day weight response.
 
 Linear in the state (A is a known input; F just varies per day). The fat
 share of change is never a state — it emerges as beta_F / beta and
@@ -35,12 +58,13 @@ only moves off p as fat readings demand it. With the deviation variances
 set to 0 it *is* the fixed-p model.
 
 Measurements:
-  scale   z = F + L + e
-  Index   z = F + c * e     (c: fixed water loading of bioimpedance)
+  scale   z = F + L + e + g
+  Index   z = F + c * (e + g)   (c: fixed water loading of bioimpedance)
   tape    z = F + btape
 
 With no fat readings, F + L, beta and kappa evolve exactly like the old
-unsplit filter (q_fat + q_lean = q_x) — weight alone can't see the split.
+unsplit filter (q_fat + q_lean = q_x) — weight alone can't see the split —
+once lam, eta and g's variances are 0.
 
 See plans/KalmanScale_v1.md Section 3 for the derivation. Default params
 below are placeholders (Milestone 6: tune against real data).
@@ -66,6 +90,10 @@ class FilterParams:
     q_e: float = 0.05      # process noise var, AR(1) transient (lb^2)
     q_btape: float = 1e-3  # process noise var, tape-vs-Index offset (lb^2/day)
     phi: float = 0.7       # AR(1) persistence of water-weight component
+    lam: float = 10.0 / KCAL_PER_LB  # metabolic adaptation (1/day): drift change per lb of tissue change
+    eta: float = 10.0      # glycogen water at equilibrium, lb per (lb/day) of tissue balance
+    phi_g: float = 0.85    # daily persistence of glycogen water (~1-2 wk to settle)
+    q_g: float = 0.005     # process noise var, glycogen water (lb^2/day)
     p_fat: float = 0.75    # prior fat share of weight change
     c_water: float = 0.0   # bioimpedance fat-mass loading on e (unestimated)
     r: float = 0.09        # measurement noise var, white residual (lb^2)
@@ -81,17 +109,18 @@ class FilterParams:
     p0_dkappa: float = 0.01  # split deviation, SD 0.1
     p0_e: float = 1.0
     p0_btape: float = 225.0  # SD 15 lb: Navy vs BIA can differ by several % BF
+    p0_g: float = 0.5      # glycogen water off its equilibrium eta * beta at the start
 
 
-# State order: [F, L, beta_F, beta_L, kappa_F, kappa_L, e, btape]
-N_STATES = 8
-_H_WEIGHT = np.array([1.0, 1.0, 0, 0, 0, 0, 1.0, 0])
-_H_TAPE = np.array([1.0, 0, 0, 0, 0, 0, 0, 1.0])
-_TOTAL = np.array([1.0, 1.0, 0, 0, 0, 0, 0, 0])
+# State order: [F, L, beta_F, beta_L, kappa_F, kappa_L, e, btape, g]
+N_STATES = 9
+_H_WEIGHT = np.array([1.0, 1.0, 0, 0, 0, 0, 1.0, 0, 1.0])
+_H_TAPE = np.array([1.0, 0, 0, 0, 0, 0, 0, 1.0, 0])
+_TOTAL = np.array([1.0, 1.0, 0, 0, 0, 0, 0, 0, 0])
 
 
 def _H_fat(c_water: float) -> np.ndarray:
-    return np.array([1.0, 0, 0, 0, 0, 0, c_water, 0])
+    return np.array([1.0, 0, 0, 0, 0, 0, c_water, 0, c_water])
 
 
 def _split(p: float) -> np.ndarray:
@@ -110,6 +139,11 @@ def _F(params: "FilterParams", ride_kcal: float) -> np.ndarray:
     F[0, 2], F[0, 4] = 1.0, -a
     F[1, 3], F[1, 5] = 1.0, -a
     F[6, 6] = params.phi
+    D = np.array([0, 0, 1.0, 1.0, -a, -a, 0, 0, 0])  # tissue change
+    F[2] -= params.p_fat * params.lam * D
+    F[3] -= (1.0 - params.p_fat) * params.lam * D
+    F[8, 8] = params.phi_g
+    F[8, 2] = F[8, 3] = (1.0 - params.phi_g) * params.eta
     return F
 
 
@@ -118,7 +152,7 @@ def _Q(params: "FilterParams") -> np.ndarray:
     Q[0, 0], Q[1, 1] = params.q_fat, params.q_lean
     Q[2:4, 2:4] = _split_cov(params.p_fat, params.q_beta, params.q_dbeta)
     Q[4:6, 4:6] = _split_cov(params.p_fat, params.q_kappa, params.q_dkappa)
-    Q[6, 6], Q[7, 7] = params.q_e, params.q_btape
+    Q[6, 6], Q[7, 7], Q[8, 8] = params.q_e, params.q_btape, params.q_g
     return Q
 
 
@@ -141,6 +175,7 @@ _READOUTS = {
     "kappa_lean": _vec(5),
     "e": _vec(6),
     "btape": _vec(7),
+    "g": _vec(8),
 }
 
 
@@ -274,6 +309,9 @@ def simulate_forecast(
     precedes the ride), then resampled past weeks (sample_future_rides,
     using blocks from history_start through the day before latest).
 
+    Weight-dependent dynamics (metabolic adaptation, glycogen water) are
+    in _F, so the median curves rather than following a straight line.
+
     Returns {"dates": [...], "q25": [...], "q50": [...], ...} (one key per
     quantile). seed defaults to latest's ordinal, so the band is stable
     across reloads and only changes when new data arrives.
@@ -284,6 +322,7 @@ def simulate_forecast(
 
     X = x + rng.standard_normal((n, N_STATES)) @ _sqrt_psd(P).T
     Q_sqrt = _sqrt_psd(_Q(params))
+    p = params.p_fat
 
     # Ride inputs for days latest .. latest + horizon - 1 (step d uses d-1).
     known_today = ride_kcal_by_date.get(latest)
@@ -299,10 +338,14 @@ def simulate_forecast(
     dates = []
     for d in range(horizon):
         a = rides[:, d] / KCAL_PER_LB
+        D = X[:, 2] + X[:, 3] - (X[:, 4] + X[:, 5]) * a
         X_next = X.copy()
         X_next[:, 0] = X[:, 0] + X[:, 2] - X[:, 4] * a
         X_next[:, 1] = X[:, 1] + X[:, 3] - X[:, 5] * a
+        X_next[:, 2] = X[:, 2] - p * params.lam * D
+        X_next[:, 3] = X[:, 3] - (1.0 - p) * params.lam * D
         X_next[:, 6] = params.phi * X[:, 6]
+        X_next[:, 8] = params.phi_g * X[:, 8] + (1.0 - params.phi_g) * params.eta * (X[:, 2] + X[:, 3])
         X = X_next + rng.standard_normal((n, N_STATES)) @ Q_sqrt.T
 
         total = X[:, 0] + X[:, 1]
@@ -315,9 +358,11 @@ def simulate_forecast(
 def projected_trend(
     latest: dict, ride_kcal_per_day: float, part: str = ""
 ) -> tuple[float, float]:
-    """(trend, se) in lb/day: beta plus the ride term at the forecast ride
-    volume, beta - kappa * A / 3500, with the beta/kappa covariance in the
-    SE. part is "" for total weight, "_fat" or "_lean" for one component."""
+    """(trend, se) in lb/day of tissue change as of today: beta plus the
+    ride term at the forecast ride volume, beta - kappa * A / 3500, with
+    the beta/kappa covariance in the SE. Metabolic adaptation slows it from
+    here on (simulate_forecast accounts for that). part is "" for total
+    weight, "_fat" or "_lean" for one component."""
     a = ride_kcal_per_day / KCAL_PER_LB
     trend = latest[f"beta{part}"] - latest[f"kappa{part}"] * a
     var = (
@@ -390,7 +435,7 @@ def filter_states(
     fat0 = weight0 * (bf0 / 100.0 if bf0 is not None else params.fat_frac0)
     p = params.p_fat
     x = np.array(
-        [fat0, weight0 - fat0, 0.0, 0.0, p * params.kappa0, (1 - p) * params.kappa0, 0.0, 0.0]
+        [fat0, weight0 - fat0, 0.0, 0.0, p * params.kappa0, (1 - p) * params.kappa0, 0.0, 0.0, 0.0]
     )
     P = np.zeros((N_STATES, N_STATES))
     # Independent priors on total weight (p0_x) and fat (p0_fat), mapped
@@ -401,7 +446,12 @@ def filter_states(
     P[0, 1] = P[1, 0] = -params.p0_fat
     P[2:4, 2:4] = _split_cov(p, params.p0_beta, params.p0_dbeta)
     P[4:6, 4:6] = _split_cov(p, params.p0_kappa, params.p0_dkappa)
-    P[6, 6], P[7, 7] = params.p0_e, params.p0_btape
+    P[6, 6], P[7, 7], P[8, 8] = params.p0_e, params.p0_btape, params.p0_g
+    # Glycogen water starts near its equilibrium for the (unknown) drift,
+    # g = eta * beta, give or take p0_g — no assumed diet change at day 1.
+    T = np.eye(N_STATES)
+    T[8, 2] = T[8, 3] = params.eta
+    P = T @ P @ T.T
 
     yield first["date"], x, P
     prev_date = first["date"]

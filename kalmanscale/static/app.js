@@ -75,8 +75,9 @@ function renderStats(latest) {
       ${stat("Baseline (&beta;)", lbWk(latest.beta), `&plusmn;${(latest.se_beta * 7).toFixed(2)}/wk &middot; with no riding &middot; ${split("beta")}`)}
       ${stat("Ride kcal kept off (&kappa;)", `${(latest.kappa * 100).toFixed(0)}%`, `&plusmn;${(latest.se_kappa * 100).toFixed(0)}% &middot; fat ${(latest.kappa_fat * 100).toFixed(0)}% &middot; lean ${(latest.kappa_lean * 100).toFixed(0)}%`)}
       ${stat("Fat mass", `${latest.fat.toFixed(1)} lb`, `&plusmn;${latest.se_fat.toFixed(1)} &middot; ${(latest.fat / latest.x * 100).toFixed(1)}% &middot; on the Garmin Index scale`)}
-      ${stat("Lean mass", `${latest.lean.toFixed(1)} lb`, `&plusmn;${latest.se_lean.toFixed(1)} &middot; excludes transient water (e)`)}
+      ${stat("Lean mass", `${latest.lean.toFixed(1)} lb`, `&plusmn;${latest.se_lean.toFixed(1)} &middot; excludes water (e, g)`)}
       ${stat("Water-weight (e)", `${latest.e.toFixed(2)} lb`, "AR(1) transient")}
+      ${stat("Glycogen water (g)", `${latest.g.toFixed(2)} lb`, `&plusmn;${latest.se_g.toFixed(2)} &middot; settles with your baseline drift`)}
       ${stat("Tape vs Index offset", `${latest.btape > 0 ? "+" : ""}${latest.btape.toFixed(1)} lb fat`, `&plusmn;${latest.se_btape.toFixed(1)} &middot; Navy formula minus Index`)}
     </div>
     <div class="caveat">Trend = &beta; &minus; &kappa; &times; forecast ride kcal / 3500, where the forecast is an EWMA of your recent 7-day blocks of riding (most recent week weighted 1, then 0.7, 0.49, &hellip;). &kappa; only becomes identifiable once ride volume varies over time. Fat and lean each have their own drift and ride response, starting from a 75/25 fat/lean split of weight change; Index and tape readings measure fat, so the split is learned from them over months (lean drift slowest).</div>

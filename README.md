@@ -14,13 +14,18 @@ much gets eaten back. A Kalman filter combines:
   ride kcal / 3500, where κ — the fraction of ride kcal *not* eaten back — is learned
   from how weight responds to changes in ride volume
 - **Measurements**: daily scale weight, plus Garmin Index body-fat % (as fat mass)
+- **Curvature**: maintenance burn falls ~10 kcal/day per lb lost, so β shifts by
+  λ = 10/3500 per lb of tissue change and loss slows toward an equilibrium. Water
+  held with glycogen settles at η lb per lb/day of β over ~1–2 weeks, so the
+  one-time drop when a deficit starts isn't read as trend
 
 No intake logging required.
 
 The chart extends 30 days ahead with a Monte Carlo forecast: 2,000 draws from the
 filter's current posterior, stepped forward with its own dynamics, with future rides
-resampled from your past 7-day training weeks (recent weeks favored). It shows the
-median true weight and a 50% interval.
+resampled from your past 7-day training weeks (recent weeks favored). Because β adapts as weight
+changes, the median curves toward equilibrium rather than running in a straight
+line. It shows the median true weight and a 50% interval.
 
 ## Setup
 
