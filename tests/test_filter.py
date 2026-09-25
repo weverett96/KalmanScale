@@ -8,7 +8,13 @@ from datetime import date, timedelta
 import numpy as np
 import pytest
 
-from kalmanscale.filter import FilterParams, forecast_ride_kcal, projected_trend, run_filter
+from kalmanscale.filter import (
+    FilterParams,
+    forecast_ride_kcal,
+    navy_body_fat_pct,
+    projected_trend,
+    run_filter,
+)
 
 np.random.seed(0)
 
@@ -266,3 +272,51 @@ def test_projected_trend_combines_beta_and_kappa():
     assert se == pytest.approx(np.hypot(0.02, 0.2 * 0.1))
     # With no riding, trend is just beta.
     assert projected_trend(latest, 0.0) == (pytest.approx(0.05), pytest.approx(0.02))
+
+
+def test_navy_body_fat_pct_hand_computed():
+    # 86.010*log10(24) - 70.041*log10(64.5) + 36.76
+    expected = 86.010 * 1.380211 - 70.041 * 1.809560 + 36.76
+    assert navy_body_fat_pct(40.5, 16.5, 64.5) == pytest.approx(expected, abs=1e-3)
+    assert navy_body_fat_pct(38.5, 16.5, 64.5) < navy_body_fat_pct(40.5, 16.5, 64.5)
+
+
+def _fat_series(n, true_fat, offset, tape_every, seed, weight=200.0):
+    """Constant true fat; daily noisy Index readings (SD 5 lb) and, every
+    `tape_every` days, a precise tape reading (SD 1 lb) offset by `offset`."""
+    rng = np.random.default_rng(seed)
+    entries = []
+    for i, d in enumerate(_dates(n)):
+        entry = {"date": d, "weight": weight}
+        entry["body_fat_pct"] = (true_fat + rng.normal(0, 5.0)) / weight * 100.0
+        if tape_every and i % tape_every == 0:
+            entry["tape_bf_pct"] = (true_fat + offset + rng.normal(0, 1.0)) / weight * 100.0
+        entries.append(entry)
+    return entries
+
+
+def test_tape_offset_recovered():
+    final = run_filter(_fat_series(120, 45.0, 14.0, tape_every=7, seed=5))[-1]
+    assert final["btape"] == pytest.approx(14.0, abs=3 * final["se_btape"])
+    assert final["fat"] == pytest.approx(45.0, abs=3 * final["se_fat"])
+
+
+def test_tape_readings_tighten_fat_estimate():
+    # Short window where Index noise dominates: weekly tape shouldn't hurt,
+    # and must shrink fat uncertainty once the offset is learned.
+    bia_only = run_filter(_fat_series(120, 45.0, 14.0, tape_every=0, seed=6))[-1]
+    with_tape = run_filter(_fat_series(120, 45.0, 14.0, tape_every=7, seed=6))[-1]
+    assert with_tape["se_fat"] < bia_only["se_fat"]
+
+
+def test_tape_only_touches_fat_and_offset():
+    # Option A: fat/btape are uncoupled, so a tape reading must not move
+    # x/beta/kappa/e or their SEs.
+    base = [{"date": d, "weight": 200.0 - 0.1 * i} for i, d in enumerate(_dates(10))]
+    with_tape = [dict(e) for e in base]
+    with_tape[5]["tape_bf_pct"] = 28.0  # no Index reading that day
+    rides = {_dates(10)[3]: 900.0}
+    for a, b in zip(run_filter(base, rides), run_filter(with_tape, rides)):
+        for key in ("x", "beta", "kappa", "e", "se_x", "se_beta", "se_kappa", "se_e"):
+            assert a[key] == pytest.approx(b[key])
+    assert run_filter(with_tape, rides)[5]["se_btape"] < run_filter(base, rides)[5]["se_btape"]

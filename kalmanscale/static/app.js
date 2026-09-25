@@ -8,16 +8,33 @@ async function api(path, opts) {
 }
 
 let ridesByDate = {};
+let tapeByDate = {};
 let chart = null;
 
 const syncStatus = document.getElementById("sync-status");
 const statsEl = document.getElementById("stats");
+const heightInput = document.getElementById("height_in");
+const neckInput = document.getElementById("neck_in");
+
+async function saveSettings() {
+  const height_in = parseFloat(heightInput.value);
+  const neck_in = parseFloat(neckInput.value);
+  if (!(height_in > 0 && neck_in > 0)) return;
+  await api("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ height_in, neck_in }),
+  });
+  await refresh();
+}
+heightInput.addEventListener("change", saveSettings);
+neckInput.addEventListener("change", saveSettings);
 
 document.getElementById("sync-btn").addEventListener("click", async () => {
   syncStatus.textContent = "Syncing...";
   try {
     const result = await api("/api/intervals/sync", { method: "POST" });
-    syncStatus.textContent = `Synced ${result.oldest} to ${result.newest}: ${result.weigh_ins} weigh-ins, ${result.ride_days} ride days.`;
+    syncStatus.textContent = `Synced ${result.oldest} to ${result.newest}: ${result.weigh_ins} weigh-ins, ${result.ride_days} ride days, ${result.tape_days} abdomen readings.`;
     await refresh();
   } catch (e) {
     syncStatus.textContent = "Sync failed: " + e.message;
@@ -54,7 +71,8 @@ function renderStats(latest) {
       ${stat("Baseline (&beta;)", lbWk(latest.beta), `&plusmn;${(latest.se_beta * 7).toFixed(2)}/wk &middot; with no riding &middot; ${zNote(latest.beta, latest.se_beta)}`)}
       ${stat("Ride kcal kept off (&kappa;)", `${(latest.kappa * 100).toFixed(0)}%`, `&plusmn;${(latest.se_kappa * 100).toFixed(0)}% &middot; share of ride kcal not eaten back`)}
       ${stat("Water-weight (e)", `${latest.e.toFixed(2)} lb`, "AR(1) transient")}
-      ${stat("Fat mass", `${latest.fat.toFixed(1)} lb`, `&plusmn;${latest.se_fat.toFixed(1)} &middot; from Garmin Index bioimpedance`)}
+      ${stat("Fat mass", `${latest.fat.toFixed(1)} lb`, `&plusmn;${latest.se_fat.toFixed(1)} &middot; on the Garmin Index scale, informed by tape readings`)}
+      ${stat("Tape vs Index offset", `${latest.btape > 0 ? "+" : ""}${latest.btape.toFixed(1)} lb fat`, `&plusmn;${latest.se_btape.toFixed(1)} &middot; Navy formula minus Index`)}
     </div>
     <div class="caveat">Trend = &beta; &minus; &kappa; &times; forecast ride kcal / 3500, where the forecast is an EWMA of your recent 7-day blocks of riding (most recent week weighted 1, then 0.7, 0.49, &hellip;). &kappa; only becomes identifiable once ride volume varies over time. Fat mass is currently an independent estimate, not yet coupled into the weight/trend dynamics.</div>
   `;
@@ -105,7 +123,7 @@ function renderTable(entries) {
   for (const e of [...entries].reverse()) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${e.date}</td><td>${e.weight}</td><td>${e.body_fat_pct ?? ""}</td><td>${prevDayRideKcal(e.date) ?? ""}</td>
+      <td>${e.date}</td><td>${e.weight}</td><td>${e.body_fat_pct ?? ""}</td><td>${tapeByDate[e.date] ?? ""}</td><td>${prevDayRideKcal(e.date) ?? ""}</td>
     `;
     tbody.appendChild(tr);
   }
@@ -114,6 +132,10 @@ function renderTable(entries) {
 async function refresh() {
   const entries = await api("/api/entries");
   ridesByDate = await api("/api/rides");
+  tapeByDate = await api("/api/tape");
+  const settings = await api("/api/settings");
+  if (document.activeElement !== heightInput) heightInput.value = settings.height_in;
+  if (document.activeElement !== neckInput) neckInput.value = settings.neck_in;
 
   const filterResult = await api("/api/filter");
   renderStats(filterResult.latest);

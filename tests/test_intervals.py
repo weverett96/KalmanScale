@@ -29,3 +29,14 @@ def test_parse_rides_filters_types_prefers_work_and_sums_per_day():
     ]
     out = parse_rides(activities)
     assert out == {"2026-09-01": 1300, "2026-09-02": 1100}
+
+
+def test_parse_abdomen_converts_cm_to_inches():
+    from kalmanscale.intervals import parse_abdomen
+
+    records = [
+        {"id": "2026-09-25", "abdomen": 102.87},
+        {"id": "2026-09-24", "abdomen": None},
+        {"id": "2026-09-23"},
+    ]
+    assert parse_abdomen(records) == {"2026-09-25": pytest.approx(40.5)}

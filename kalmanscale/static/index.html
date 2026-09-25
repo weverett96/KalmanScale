@@ -25,6 +25,21 @@
   </div>
 
   <div class="card">
+    <h2>Body measurements</h2>
+    <div class="field-row">
+      <div class="field">
+        <label for="height_in">Height <span class="unit">in</span></label>
+        <input type="number" step="0.1" id="height_in">
+      </div>
+      <div class="field">
+        <label for="neck_in">Neck <span class="unit">in</span></label>
+        <input type="number" step="0.1" id="neck_in">
+      </div>
+    </div>
+    <div class="sync-note">Current values only, no history. Used with abdomen (logged in intervals.icu, at the navel) for the Navy body-fat formula.</div>
+  </div>
+
+  <div class="card">
     <h2>Filtered trend</h2>
     <div id="stats"></div>
   </div>
@@ -38,7 +53,7 @@
     <h2>Log</h2>
     <div class="table-scroll">
       <table id="entries-table">
-        <thead><tr><th>Date</th><th>Weight</th><th>Body fat %</th><th>Prev-day ride kcal</th></tr></thead>
+        <thead><tr><th>Date</th><th>Weight</th><th>Body fat %</th><th>Abdomen in</th><th>Prev-day ride kcal</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>

@@ -13,6 +13,15 @@ CREATE TABLE IF NOT EXISTS rides (
     date TEXT PRIMARY KEY,      -- ISO 8601, local start date
     kcal REAL NOT NULL          -- summed over that day's rides
 );
+CREATE TABLE IF NOT EXISTS tape (
+    date TEXT PRIMARY KEY,      -- ISO 8601
+    abdomen_in REAL NOT NULL    -- at the navel
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,       -- no history: one current value per key
+    value REAL NOT NULL
+);
+INSERT OR IGNORE INTO settings (key, value) VALUES ('height_in', 64.5), ('neck_in', 16.5);
 """
 
 
@@ -55,17 +64,47 @@ def list_entries() -> list[dict]:
     return [{"date": r[0], "weight": r[1], "body_fat_pct": r[2]} for r in rows]
 
 
-def replace_rides(oldest: str, newest: str, kcal_by_date: dict[str, float]) -> None:
-    """Replace all ride rows in [oldest, newest] with kcal_by_date, so rides
-    deleted or edited upstream are corrected on the next sync."""
+def _replace_range(table: str, column: str, oldest: str, newest: str, by_date: dict) -> None:
+    """Replace all rows of `table` in [oldest, newest] with by_date, so
+    values deleted or edited upstream are corrected on the next sync."""
     with _conn() as conn:
-        conn.execute("DELETE FROM rides WHERE date BETWEEN ? AND ?", (oldest, newest))
+        conn.execute(f"DELETE FROM {table} WHERE date BETWEEN ? AND ?", (oldest, newest))
         conn.executemany(
-            "INSERT INTO rides (date, kcal) VALUES (?, ?)", sorted(kcal_by_date.items())
+            f"INSERT INTO {table} (date, {column}) VALUES (?, ?)", sorted(by_date.items())
         )
 
 
-def list_rides() -> dict[str, float]:
+def _list_by_date(table: str, column: str) -> dict[str, float]:
     with _conn() as conn:
-        rows = conn.execute("SELECT date, kcal FROM rides ORDER BY date ASC").fetchall()
+        rows = conn.execute(f"SELECT date, {column} FROM {table} ORDER BY date ASC").fetchall()
     return {r[0]: r[1] for r in rows}
+
+
+def replace_rides(oldest: str, newest: str, kcal_by_date: dict[str, float]) -> None:
+    _replace_range("rides", "kcal", oldest, newest, kcal_by_date)
+
+
+def list_rides() -> dict[str, float]:
+    return _list_by_date("rides", "kcal")
+
+
+def replace_tape(oldest: str, newest: str, abdomen_by_date: dict[str, float]) -> None:
+    _replace_range("tape", "abdomen_in", oldest, newest, abdomen_by_date)
+
+
+def list_tape() -> dict[str, float]:
+    return _list_by_date("tape", "abdomen_in")
+
+
+def get_settings() -> dict[str, float]:
+    with _conn() as conn:
+        return dict(conn.execute("SELECT key, value FROM settings").fetchall())
+
+
+def set_settings(values: dict[str, float]) -> None:
+    with _conn() as conn:
+        conn.executemany(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            values.items(),
+        )

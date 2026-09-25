@@ -26,6 +26,7 @@ BASE_URL = "https://intervals.icu/api/v1/athlete/0"
 USER_AGENT = "KalmanScale/0.1 (personal weight-trend app)"
 
 LB_PER_KG = 2.20462
+CM_PER_IN = 2.54
 
 # With a power meter, ride kJ ≈ kcal burned: the 4.184 kJ/kcal conversion
 # roughly cancels ~24% gross cycling efficiency, so mechanical work in kJ is
@@ -96,6 +97,16 @@ def parse_wellness(records: list[dict]) -> dict[str, tuple[float, float | None]]
     return out
 
 
+def parse_abdomen(records: list[dict]) -> dict[str, float]:
+    """{"YYYY-MM-DD": abdomen_in}. intervals.icu returns abdomen in cm
+    regardless of display units (verified: 102.87 logged as 40.5 in)."""
+    return {
+        rec["id"]: round(rec["abdomen"] / CM_PER_IN, 2)
+        for rec in records
+        if rec.get("abdomen")
+    }
+
+
 def _ride_kcal(activity: dict) -> float | None:
     joules = activity.get("icu_joules")
     if joules:
@@ -117,10 +128,9 @@ def parse_rides(activities: list[dict]) -> dict[str, float]:
     return {day: round(kcal) for day, kcal in out.items()}
 
 
-def fetch_wellness(oldest: Date, newest: Date) -> dict[str, tuple[float, float | None]]:
-    return parse_wellness(
-        _get("/wellness", {"oldest": oldest.isoformat(), "newest": newest.isoformat()})
-    )
+def fetch_wellness(oldest: Date, newest: Date) -> list[dict]:
+    """Raw wellness records; parse with parse_wellness / parse_abdomen."""
+    return _get("/wellness", {"oldest": oldest.isoformat(), "newest": newest.isoformat()})
 
 
 def fetch_rides(oldest: Date, newest: Date) -> dict[str, float]:
